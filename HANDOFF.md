@@ -10,7 +10,7 @@
 2. **禁触清单**：`napcat/`（第三方协议端）、真实 `.env` 的值（可读结构不许写/不许输出值）、`data/`（用户记忆/人设/登录态）、`tools/adb/`。
 3. **绝不调用** `douyin.connect()` / `douyin.start()`——测试机手机可能正插着，会真刷。测试一律 FakeDevice/mock。
 4. **安全措施不得削弱**：CSRF 中间件、XSS textContent、Key 掩码（`_looks_masked`）、日志脱敏、`.env` 注入校验、`_cmd_gate`——所有回归测试必须继续通过。
-5. **验证闭环**：`.venv\Scripts\python.exe -m unittest discover tests`（当前 48 用例）+ `.venv\Scripts\python.exe -m ruff check app tools tests --select F,E9,ASYNC,B,UP041` 全绿才算完成。
+5. **验证闭环**：`.venv\Scripts\python.exe -m unittest discover tests`（当前 89 用例）+ `.venv\Scripts\python.exe -m ruff check app tools tests --select F,E9,ASYNC,B,UP041` 全绿才算完成。
 6. **部署边界**：开发 AI 不重启内核/面板/QQ 服务（QQ 登录态在；重启由维护方执行）。需要运行时验证的写 NOT RUN + 手工步骤。
 7. **最小 patch**：不改现有指令名/人设格式/记忆格式/面板结构；新功能优先做成**插件或独立模块**。
 
@@ -54,7 +54,7 @@ QQ协议端 NapCat               app/napcat_runner.py 拉起，反向 WS 连内�
 ## 4. 验证命令
 
 ```bat
-.venv\Scripts\python.exe -m unittest discover tests -v      :: 48 用例
+.venv\Scripts\python.exe -m unittest discover tests -v      :: 89 用例
 .venv\Scripts\python.exe -m ruff check app tools tests --select F,E9,ASYNC,B,UP041
 .venv\Scripts\python.exe -m app.check_api                    :: 模型连通
 ```
@@ -66,7 +66,7 @@ QQ协议端 NapCat               app/napcat_runner.py 拉起，反向 WS 连内�
 [状态] DONE/PARTIAL/SKIP
 [改动] 文件清单
 [实现] 思路 3-5 句
-[测试] 新增用例名 + 全量 48 用例结果（真实输出）
+[测试] 新增用例名 + 全量 89 用例结果（真实输出）
 [部署] 需要重启内核/面板？页面 F5 即生效？
 [NOT RUN] 真机/真 QQ 验证项 + 手工步骤
 ```

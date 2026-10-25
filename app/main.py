@@ -64,6 +64,20 @@ def _register_healthz() -> None:  # 仅本机排障用；HOST 已限定 127.0.0.
             }
         except Exception as exc:
             payload["deepseek"] = {"error": str(exc)[:120]}
+        try:
+            from .plugins import schedule as _schedule
+            from . import plugin_manager as _pm
+            payload["schedule"] = {
+                "running": _schedule.is_running(),
+                "enabled": _pm.is_enabled("schedule"),
+            }
+        except Exception as exc:
+            payload["schedule"] = {"running": False, "error": str(exc)[:120]}
+        try:
+            from . import jailbreak as _jb
+            payload["jailbreak"] = _jb.status()
+        except Exception as exc:
+            payload["jailbreak"] = {"error": str(exc)[:120]}
         return payload
 
 

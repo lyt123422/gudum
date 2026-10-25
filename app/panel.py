@@ -21,7 +21,7 @@ import uvicorn
 from fastapi import FastAPI, Request
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
 
-from . import personas, plugin_manager
+from . import jailbreak, personas, plugin_manager, schedule_core
 from .envutil import EnvValueError, load_env, update_env as _env_update
 from .log_setup import redact_log
 
@@ -564,6 +564,105 @@ async def api_plugin_install(request: Request) -> dict:
     return {"ok": True, "restarted": restarted, "log": log[-200:]}
 
 
+@app.get("/api/jailbreak/selftest")
+def api_jailbreak_selftest() -> dict:
+    """自检：条款能不能拼、状态是否真生效、内核进程里有没有加载破甲。
+
+    存在的意义：本次实测发现"面板改了没生效"的头号原因是内核/面板进程跑的还是旧代码。
+    这里把代码版本、内核插件表、条款长度一次摆出来，让这类问题自己暴露。
+    """
+    lines: list[str] = []
+    problems: list[str] = []
+
+    # 1) 条款能否拼出来
+    try:
+        clause = jailbreak.render_clause()
+        has_core = "【回答尺度" in clause
+        has_red = "【不可覆盖的红线" in clause
+        lines.append(f"· 条款拼接：{len(clause)} 字，"
+                     f"含尺度段={has_core}，含红线段={has_red}")
+        if not (has_core and has_red):
+            problems.append("条款拼接不完整（缺尺度段或红线段）")
+    except Exception as exc:
+        lines.append(f"· 条款拼接：异常 {exc}")
+        problems.append(f"条款拼接异常：{exc}")
+
+    # 2) 状态是否真生效
+    st = jailbreak.status()
+    lines.append(f"· 状态：插件开关={st['enabled']}，暂停={st['paused']}，"
+                 f"实际生效={st['active']}，预设={st['preset']}")
+    if st["enabled"] and st["paused"]:
+        problems.append("破甲处于暂停状态，不会注入（发「破甲继续」恢复）")
+    if not st["enabled"]:
+        problems.append("破甲插件开关是关闭的，不会注入（点「启动破甲」）")
+
+    # 3) 内核进程里有没有这个模块（面板与内核是两个进程，改代码不重启就白改）
+    kernel: dict = {}
+    try:
+        resp = httpx.get(f"http://127.0.0.1:{BOT_PORT}/healthz", timeout=2.0)
+        kernel = resp.json() if resp.status_code == 200 else {}
+    except Exception as exc:
+        lines.append(f"· 内核：连不上（{str(exc)[:60]}）—— 内核没运行时破甲自然不生效")
+        problems.append("内核没在运行")
+    if kernel:
+        plugins = kernel.get("plugins") or []
+        jb = kernel.get("jailbreak")
+        lines.append(f"· 内核：已加载插件 {plugins}")
+        if jb is None:
+            lines.append("· 内核破甲字段：缺失 —— 内核跑的是旧代码，需要重启内核")
+            problems.append("内核进程是旧代码（healthz 没有 jailbreak 字段），重启内核才能加载破甲")
+        else:
+            lines.append(f"· 内核破甲状态：{jb}")
+            if isinstance(jb, dict) and jb.get("active") is not True:
+                problems.append("内核侧破甲未生效（看上面内核破甲状态）")
+        model = (kernel.get("deepseek") or {}).get("model")
+        if model:
+            lines.append(f"· 当前模型：{model}")
+            if "deepseek" not in str(model).lower() and "gemini" in str(model).lower():
+                lines.append("  提示：走的是第三方/代理模型，服务端可能有自己的内容策略，"
+                             "破甲只能改本机注入的提示词")
+
+    # 4) 管理员范围
+    try:
+        env = load_env(ENV_FILE)
+        scope = (env.get("JAILBREAK_SCOPE") or "admin").strip().lower()
+        supers = env.get("SUPERUSERS", "")
+        lines.append(f"· 生效范围：{scope}（admin=仅管理员）；SUPERUSERS={supers}")
+        if scope == "admin" and supers in ("", '["10000"]'):
+            problems.append("还没有真实管理员（SUPERUSERS 仍是占位 10000），"
+                            "admin 范围下谁都不会生效")
+    except Exception as exc:
+        lines.append(f"· 配置读取失败：{exc}")
+
+    return {
+        "ok": not problems,
+        "report": "\n".join(lines + (["", "发现的问题："] + [f"！{p}" for p in problems]
+                                    if problems else ["", "没有发现问题。"])),
+        "clause_preview": jailbreak.render_clause()[:300],
+    }
+
+
+@app.get("/api/jailbreak")
+async def api_jailbreak() -> dict:
+    """破甲状态：开关 / 暂停 / 预设 / 可选预设列表。"""
+    return jailbreak.status()
+
+
+@app.post("/api/jailbreak/set")
+async def api_jailbreak_set(request: Request) -> dict:
+    """改破甲：enabled / paused / preset 三个字段，传哪个改哪个。"""
+    body = await _body_json(request)
+    if "enabled" in body:
+        jailbreak.set_enabled(bool(body["enabled"]))
+    if "paused" in body:
+        jailbreak.set_paused(bool(body["paused"]))
+    if "preset" in body:
+        name = str(body["preset"] or "").strip()
+        if name and not jailbreak.set_preset(name):
+            return {"ok": False, "error": f"没有这个预设：{name}"}
+    return {"ok": True, **jailbreak.status()}
+
+
 @app.post("/api/plugin/uninstall")
 async def api_plugin_uninstall(request: Request) -> dict:
     body = await _body_json(request)
@@ -620,21 +719,24 @@ async def api_persona_delete(request: Request) -> dict:
     return {"ok": True}
 
 
-# ---------- 定时任务（面板配置端，增删改查走插件自身的状态文件） ----------
+# ---------- 定时任务（面板配置端，纯 core 不依赖 nonebot） ----------
 
-def _schedule_mod():
-    """延迟导入：内核插件模块带 nonebot 依赖，面板单独运行时不该被拖崩。"""
-    from .plugins import schedule
-    return schedule
+async def _kernel_schedule_running() -> bool:
+    """向内核 healthz 询问调度器状态；内核没起就返回 False。"""
+    try:
+        async with httpx.AsyncClient(timeout=0.6) as client:
+            resp = await client.get(f"http://127.0.0.1:{BOT_PORT}/healthz")
+            return bool((resp.json().get("schedule") or {}).get("running"))
+    except Exception:
+        return False
 
 
 @app.get("/api/schedule")
 async def api_schedule() -> dict:
-    try:
-        mod = _schedule_mod()
-    except Exception as exc:
-        return {"ok": False, "error": f"定时任务模块不可用：{exc}", "tasks": []}
-    return {"ok": True, **await asyncio.to_thread(mod.plugin_status)}
+    tasks = await asyncio.to_thread(schedule_core.merged_tasks)
+    return {"ok": True, "tasks": tasks,
+            "running": await _kernel_schedule_running(),
+            "max_tasks": schedule_core.MAX_TASKS}
 
 
 @app.post("/api/schedule/save")
@@ -645,37 +747,31 @@ async def api_schedule_save(request: Request) -> dict:
     content = str(body.get("content") or "").strip()
     target = str(body.get("target") or "").strip()
     task_type = "private" if str(body.get("type")) == "private" else "group"
-    enabled = bool(body.get("enabled", True))
+    raw_enabled = body.get("enabled", True)
+    enabled = raw_enabled if isinstance(raw_enabled, bool) else \
+        str(raw_enabled).lower() in ("true", "1", "yes", "on")
     # 前端已剥前缀，但直接调 API / 手工填表也可能带，服务端再兜一层
     if target.lower().startswith("friend:"):
         task_type, target = "private", target.split(":", 1)[1].strip()
-    try:
-        mod = _schedule_mod()
-    except Exception as exc:
-        return {"ok": False, "error": f"定时任务模块不可用：{exc}"}
-    if name and any(t["name"] == name for t in await asyncio.to_thread(mod._load)):
+    existing = await asyncio.to_thread(schedule_core.load_tasks)
+    if name and any(t["name"] == name for t in existing):
         ok, msg = await asyncio.to_thread(
-            mod.update_task, name, cron=cron, content=content,
+            schedule_core.update_task, name, cron=cron, content=content,
             target=target, type=task_type, enabled=enabled)
     else:
         ok, msg = await asyncio.to_thread(
-            mod.add_task, name, cron, content, target, task_type, enabled)
-    # 保存即确保调度器在跑（面板侧没有内核事件循环时 add_task 仍可用）
+            schedule_core.add_task, name, cron, content, target, task_type, enabled)
     return {"ok": ok, "error": "" if ok else msg, "msg": msg,
-            "tasks": await asyncio.to_thread(lambda: mod.plugin_status()["tasks"])}
+            "tasks": await asyncio.to_thread(schedule_core.merged_tasks)}
 
 
 @app.post("/api/schedule/delete")
 async def api_schedule_delete(request: Request) -> dict:
     body = await _body_json(request)
     name = str(body.get("name") or "").strip()
-    try:
-        mod = _schedule_mod()
-    except Exception as exc:
-        return {"ok": False, "error": f"定时任务模块不可用：{exc}"}
-    ok, msg = await asyncio.to_thread(mod.remove_task, name)
+    ok, msg = await asyncio.to_thread(schedule_core.remove_task, name)
     return {"ok": ok, "error": "" if ok else msg, "msg": msg,
-            "tasks": await asyncio.to_thread(lambda: mod.plugin_status()["tasks"])}
+            "tasks": await asyncio.to_thread(schedule_core.merged_tasks)}
 
 
 @app.post("/api/schedule/toggle")
@@ -683,13 +779,9 @@ async def api_schedule_toggle(request: Request) -> dict:
     body = await _body_json(request)
     name = str(body.get("name") or "").strip()
     enabled = bool(body.get("enabled"))
-    try:
-        mod = _schedule_mod()
-    except Exception as exc:
-        return {"ok": False, "error": f"定时任务模块不可用：{exc}"}
-    ok, msg = await asyncio.to_thread(mod.set_enabled, name, enabled)
+    ok, msg = await asyncio.to_thread(schedule_core.set_enabled, name, enabled)
     return {"ok": ok, "error": "" if ok else msg, "msg": msg,
-            "tasks": await asyncio.to_thread(lambda: mod.plugin_status()["tasks"])}
+            "tasks": await asyncio.to_thread(schedule_core.merged_tasks)}
 
 
 @app.post("/api/bot/start")

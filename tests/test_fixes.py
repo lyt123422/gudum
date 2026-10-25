@@ -745,11 +745,18 @@ class _ScheduleIsolated:
             pass
         self._tmp = tempfile.TemporaryDirectory()
         self.tmp = Path(self._tmp.name)
+        from app import schedule_core as core
         from app.plugins import schedule
         self.sched = schedule
-        patches = [mock.patch.object(schedule, "STATE_FILE",
+        self.core = core
+        patches = [mock.patch.object(core, "STATE_FILE",
                                      self.tmp / "schedules.json"),
-                   mock.patch.object(schedule, "SCHEDULE_ENABLED", True)]
+                   mock.patch.object(core, "RUNTIME_FILE",
+                                     self.tmp / "schedule_runtime.json"),
+                   mock.patch.object(schedule, "SCHEDULE_ENABLED", True),
+                   # 测试不依赖真实 data/plugins.json 的开关
+                   mock.patch.object(schedule.plugin_manager, "is_enabled",
+                                     lambda plugin_id: True)]
         for p in patches:
             p.start()
         self.addCleanup(lambda: [p.stop() for p in patches])
@@ -758,7 +765,8 @@ class _ScheduleIsolated:
         self._reset_cache()
 
     def _reset_cache(self):
-        self.sched._cache.update(at=0.0, tasks=None)
+        self.core._cache.update(at=0.0, tasks=None)
+        self.core._rt_cache.update(at=0.0, data=None)
 
 
 class TestScheduleCron(_ScheduleIsolated, unittest.TestCase):
@@ -797,6 +805,26 @@ class TestScheduleCron(_ScheduleIsolated, unittest.TestCase):
         self.assertTrue(self.sched._cron_matches(weekend, sat9))
         self.assertFalse(self.sched._cron_matches(weekend, mon9))
 
+    def test_day_or_semantics(self):
+        """标准 cron：日字段和周字段都受限时取 OR。"""
+        fields = self.sched.cron_fields("0 9 1 * 1")
+        # 2026-10-01 周四：只满足“1 号”
+        first = time.struct_time((2026, 10, 1, 9, 0, 0, 3, 1, 0))
+        # 2026-10-26 周一：只满足“周一”
+        monday = time.struct_time((2026, 10, 26, 9, 0, 0, 0, 1, 0))
+        # 2026-10-27 周二：两者都不满足
+        tuesday = time.struct_time((2026, 10, 27, 9, 0, 0, 1, 1, 0))
+        self.assertTrue(self.sched._cron_matches(fields, first))
+        self.assertTrue(self.sched._cron_matches(fields, monday))
+        self.assertFalse(self.sched._cron_matches(fields, tuesday))
+
+    def test_step_with_start_value(self):
+        """5/10 应解析为 5,15,25…55；5/1 应解析为 5..59。"""
+        fields = self.sched.cron_fields("5/10 * * * *")
+        self.assertEqual(fields["minute"], set(range(5, 60, 10)))
+        fields = self.sched.cron_fields("5/1 * * * *")
+        self.assertEqual(fields["minute"], set(range(5, 60)))
+
 
 class TestScheduleCrud(_ScheduleIsolated, unittest.TestCase):
     """增删改查 + 参数校验（不写真实 data/）。"""
@@ -810,6 +838,16 @@ class TestScheduleCrud(_ScheduleIsolated, unittest.TestCase):
         self.assertEqual(tasks[0]["target"], "123456")
         self.assertEqual(tasks[0]["type"], "group")
         self.assertIn("早报", self.sched.list_text())
+
+    def test_runtime_file_is_separate(self):
+        """任务定义不写 last_run/last_ok；运行结果单独落盘。"""
+        self.sched.add_task("早报", "0 9 * * *", "早", "123456")
+        self.assertNotIn("last_ok", self.sched._load()[0])
+        self.core.stamp_runtime("早报", 123, True)
+        self.assertNotIn("last_ok", self.sched._load()[0])
+        merged = self.core.merged_tasks()
+        self.assertTrue(merged[0]["last_ok"])
+        self.assertEqual(merged[0]["last_run"], 123)
 
     def test_add_rejects_bad_input(self):
         self.assertFalse(self.sched.add_task("", "* * * * *", "x", "1")[0])
@@ -863,15 +901,17 @@ class TestScheduleDispatch(_ScheduleIsolated, unittest.TestCase):
         sent = []
 
         class FakeBot:
-            async def send_group_msg(self, group_id, message):
+            async def send_group_msg(self, group_id, message, **kwargs):
                 if fail:
                     raise RuntimeError("Ban state forbit write req")
-                sent.append(("group", str(group_id), message))
+                sent.append(("group", str(group_id), message,
+                             kwargs.get("auto_escape")))
 
-            async def send_private_msg(self, user_id, message):
+            async def send_private_msg(self, user_id, message, **kwargs):
                 if fail:
                     raise RuntimeError("send failed")
-                sent.append(("private", str(user_id), message))
+                sent.append(("private", str(user_id), message,
+                             kwargs.get("auto_escape")))
 
         return FakeBot(), sent
 
@@ -886,6 +926,17 @@ class TestScheduleDispatch(_ScheduleIsolated, unittest.TestCase):
             self.assertEqual(asyncio.run(self.sched._tick_once(now)), 0)
         self.assertEqual(len(sent), 1)
         self.assertEqual(sent[0][1], "777")
+        self.assertTrue(sent[0][3])   # auto_escape=True，防 CQ 注入
+
+    def test_plugin_disabled_blocks_dispatch(self):
+        self.sched.add_task("整分", "* * * * *", "不该发", "777")
+        bot, sent = self._fake_bot()
+        now = time.mktime(time.struct_time((2026, 10, 26, 9, 0, 0, 0, 1, 0)))
+        with mock.patch.object(self.sched.plugin_manager, "is_enabled",
+                               lambda plugin_id: False), \
+                mock.patch.object(self.sched, "get_bot", lambda: bot):
+            self.assertEqual(asyncio.run(self.sched._tick_once(now)), 0)
+        self.assertEqual(sent, [])
 
     def test_not_due_outside_cron(self):
         self.sched.add_task("早报", "0 9 * * *", "早", "777")
@@ -912,7 +963,7 @@ class TestScheduleDispatch(_ScheduleIsolated, unittest.TestCase):
         now = time.mktime(time.struct_time((2026, 10, 26, 9, 0, 0, 0, 1, 0)))
         with mock.patch.object(self.sched, "get_bot", lambda: bot):
             self.assertEqual(asyncio.run(self.sched._tick_once(now)), 0)
-        task = self.sched._load()[0]
+        task = self.core.merged_tasks()[0]
         self.assertFalse(task["last_ok"])
         self.assertTrue(task["last_error"])
 
@@ -946,21 +997,38 @@ class TestScheduleDispatch(_ScheduleIsolated, unittest.TestCase):
             asyncio.run(asyncio.wait_for(main(), timeout=5))
         self.assertFalse(self.sched.plugin_status()["running"])
 
+    def test_startup_hook_starts_worker(self):
+        """生产启动路径：on_startup 回调里必须能把 worker 拉起来。"""
+        async def main():
+            await self.sched._start_schedule_worker()
+            self.assertTrue(self.sched.plugin_status()["running"])
+            self.sched.stop_worker()
+
+        with mock.patch.object(self.sched, "TICK_SECONDS", 0.01):
+            asyncio.run(asyncio.wait_for(main(), timeout=5))
+        self.assertFalse(self.sched.plugin_status()["running"])
+
 
 class TestSchedulePanelApi(unittest.TestCase):
     """面板 /api/schedule/*：CSRF/Host 防护同样生效（回归安全项）。"""
 
     def _client(self, tmp: Path):
         from fastapi.testclient import TestClient
-        from app import panel
-        from app.plugins import schedule
-        state = tmp / "schedules.json"
+        from app import panel, schedule_core
+
+        async def _not_running():
+            return False
+
         patches = [mock.patch.object(panel, "ENV_FILE", tmp / ".env"),
-                   mock.patch.object(schedule, "STATE_FILE", state)]
+                   mock.patch.object(schedule_core, "STATE_FILE",
+                                     tmp / "schedules.json"),
+                   mock.patch.object(schedule_core, "RUNTIME_FILE",
+                                     tmp / "schedule_runtime.json"),
+                   mock.patch.object(panel, "_kernel_schedule_running",
+                                     _not_running)]
         for p in patches:
             p.start()
         self.addCleanup(lambda: [p.stop() for p in patches])
-        self.addCleanup(schedule.stop_worker)
         return TestClient(panel.app, base_url="http://127.0.0.1:8090")
 
     def test_crud_and_security(self):
