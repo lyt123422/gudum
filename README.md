@@ -20,6 +20,11 @@
 | DeepSeek API Key | 注册 <https://platform.deepseek.com> → API Keys → 创建（sk- 开头） |
 | QQ 小号 | 给机器人用，**不要用主号**（协议端有风控/封号风险）；小号先加你主号好友 |
 
+## 下载
+
+- 源码：<https://github.com/lyt123422/gudum>
+- Windows 发布包：<https://github.com/lyt123422/gudum/releases/download/v1.0.0/gudum-v1.0.0-windows-x64.zip>
+
 ## 一键启动（发布包推荐）
 
 双击 **`一键启动.bat`**：
