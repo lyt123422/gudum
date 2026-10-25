@@ -11,9 +11,12 @@
 """
 from __future__ import annotations
 
+import asyncio
+import base64
 import json
 import os
 import random
+import re
 import threading
 import time
 from pathlib import Path
@@ -52,7 +55,59 @@ _state: dict = {"page": None, "browser_lock": threading.Lock(),
                 "thread": None, "stop": threading.Event(),
                 "pause": threading.Event(), "started_at": 0.0,
                 "plan_min": 0, "last_active": 0.0, "like_rate": 0.15,
+                "ai_mode": False, "ai_client": None, "ai_failures": 0,
                 "last_error": "", "watchdog": None}
+
+
+def _ai_client():
+    """AI 刷模式用的视觉模型客户端：与聊天共用 .env 的模型配置。"""
+    from .deepseek_api import DeepSeekClient
+    from .envutil import ENV_FILE, load_env
+    env = load_env(ENV_FILE)
+    return DeepSeekClient(
+        base_url=env.get("DEEPSEEK_BASE_URL") or "https://api.deepseek.com",
+        api_key=env.get("DEEPSEEK_API_KEY") or "",
+        model=env.get("DEEPSEEK_MODEL") or "deepseek-chat",
+        timeout=45)
+
+
+def _ai_decide(shot: bytes) -> dict:
+    """把当前画面交给视觉模型决策：next/like/watch/follow + 理由。
+
+    刷视频线程是同步线程：每次决策用独立事件循环+新客户端
+    （AsyncOpenAI 的连接池不能跨事件循环复用）。
+    """
+    from .deepseek_api import DeepSeekError
+    data_url = "data:image/png;base64," + base64.b64encode(shot).decode()
+    messages = [
+        {"role": "system", "content": (
+            "你在替用户刷抖音，看到的是当前视频的画面截图。判断内容后决定下一步。"
+            "只返回一行 JSON：{\"action\":\"next|like|watch|follow\","
+            "\"watch_seconds\":<5-25的整数>,\"reason\":\"<=15字理由\"}。"
+            "规则：普通/不感兴趣→next；画面确实出彩才 like；"
+            "创作者非常对味才 follow；想多看一会→watch。宁可 next，不要滥点赞。")},
+        {"role": "user", "content": [
+            {"type": "text", "text": "当前视频画面，决定下一步："},
+            {"type": "image_url", "image_url": {"url": data_url}}]}]
+
+    async def _call() -> str:
+        client = _ai_client()
+        return await client.chat(messages)
+
+    try:
+        text = asyncio.run(_call())
+    except DeepSeekError as exc:
+        raise RuntimeError(exc.message) from exc
+    m = re.search(r"\{.*\}", text, re.S)
+    if not m:
+        raise RuntimeError(f"AI 没有返回 JSON：{text[:60]}")
+    data = json.loads(m.group(0))
+    action = data.get("action", "next")
+    if action not in ("next", "like", "watch", "follow"):
+        action = "next"
+    return {"action": action,
+            "watch": max(3, min(30, int(data.get("watch_seconds") or 5))),
+            "reason": str(data.get("reason", ""))[:40]}
 
 
 # ---------- 账本与状态 ----------
@@ -95,6 +150,7 @@ def status() -> dict:
         browser_open = _state["page"] is not None
     return {"running": _alive(), "paused": _state["pause"].is_set(),
             "browser_open": browser_open,
+            "ai_mode": _state["ai_mode"],
             "elapsed_min": round((time.time() - _state["started_at"]) / 60, 1)
             if _alive() else 0,
             "plan_min": _state["plan_min"], "today_min": _daily_minutes(),
@@ -314,6 +370,86 @@ def _visit_author(page) -> bool:
     return False
 
 
+def _ai_scroll_loop(minutes: int, client) -> None:
+    """AI 刷：每条视频截图→视觉模型决定→执行。AI 失败自动回退随机刷。"""
+    stop = _state["stop"]
+    deadline = time.time() + minutes * 60
+    consecutive_watch = 0
+    try:
+        while not stop.is_set() and time.time() < deadline:
+            wait_end = time.time() + random.uniform(3, 6)   # 先让它播两秒
+            while time.time() < wait_end and not stop.is_set():
+                if _state["pause"].is_set():
+                    time.sleep(0.5)
+                    continue
+                time.sleep(min(0.5, max(0.05, wait_end - time.time())))
+            if stop.is_set() or _state["pause"].is_set():
+                continue
+            with _state["browser_lock"]:
+                page = _state["page"]
+                if page is None:
+                    break
+                if not _page_alive(page):
+                    _drop_page()
+                    break
+            try:
+                if not _in_feed(page) and not _enter_feed(page):
+                    page.get("https://www.douyin.com/?recommend=1", timeout=20)
+                    continue
+                shot = page.get_screenshot(as_bytes="png")
+            except Exception as exc:   # noqa: BLE001
+                _state["last_error"] = str(exc)[:200]
+                with _state["browser_lock"]:
+                    if _state["page"] is not None and not _page_alive(_state["page"]):
+                        _drop_page()
+                break
+            _touch()
+            try:
+                d = _ai_decide(shot)
+                _state["ai_failures"] = 0
+            except Exception as exc:   # noqa: BLE001
+                # AI 挂了不硬撑：连续 3 次失败后本轮回退随机刷（保留会话）
+                _state["ai_failures"] += 1
+                logger.warning("AI 决策失败({}/3)，本轮回退随机: {}",
+                               _state["ai_failures"], str(exc)[:120])
+                if _state["ai_failures"] >= 3:
+                    _state["last_error"] = f"AI 连续失败已回退随机刷: {str(exc)[:120]}"
+                    logger.warning("AI 连续失败，剩余时间回退随机刷模式")
+                    _scroll_loop(max(1, int((deadline - time.time()) / 60)))
+                    return
+                _wheel(page, random.randint(600, 1000))
+                continue
+            logger.info("🤖 AI 刷抖音: {} ({})", d["action"], d["reason"])
+            if d["action"] == "like":
+                ok, _ = _find_and_click(page, _LIKE_SELECTORS)
+                time.sleep(random.uniform(1.5, 3))
+                _wheel(page, random.randint(600, 1000))
+                consecutive_watch = 0
+            elif d["action"] == "follow":
+                ok, _ = _find_and_click(page, _FOLLOW_SELECTORS)
+                time.sleep(random.uniform(2, 4))
+                _wheel(page, random.randint(600, 1000))
+                consecutive_watch = 0
+            elif d["action"] == "watch":
+                consecutive_watch += 1
+                if consecutive_watch >= 2:   # 同一条最多真看两轮，防止卡死
+                    _wheel(page, random.randint(600, 1000))
+                    consecutive_watch = 0
+                else:
+                    rest_end = time.time() + d["watch"]
+                    while time.time() < rest_end and not stop.is_set():
+                        if _state["pause"].is_set():
+                            break
+                        time.sleep(1)
+            else:
+                _wheel(page, random.randint(600, 1000))
+                consecutive_watch = 0
+    except Exception as exc:   # noqa: BLE001
+        _state["last_error"] = str(exc)[:200]
+    finally:
+        _add_daily(int((time.time() - _state["started_at"]) / 60) or 1)
+
+
 def _scroll_loop(minutes: int) -> None:
     stop = _state["stop"]
     deadline = time.time() + minutes * 60
@@ -412,7 +548,7 @@ def _start_watchdog() -> None:
 
 # ---------- 对外操作（QQ 指令入口） ----------
 
-def start(minutes: int) -> tuple[bool, str]:
+def start(minutes: int, ai: bool = False) -> tuple[bool, str]:
     with _state["browser_lock"]:
         if _state["thread"] and not _state["thread"].is_alive():
             _state["thread"] = None   # 清理已结束的旧线程引用
@@ -422,6 +558,12 @@ def start(minutes: int) -> tuple[bool, str]:
         if _daily_minutes() + minutes > MAX_DAILY_MIN:
             left = max(0, MAX_DAILY_MIN - _daily_minutes())
             return False, f"今日上限 {MAX_DAILY_MIN} 分钟，还剩 {left} 分钟"
+        ai_client = None
+        if ai:
+            try:
+                ai_client = _ai_client()
+            except Exception as exc:   # noqa: BLE001
+                return False, f"AI 客户端初始化失败：{str(exc)[:120]}"
         try:
             _ensure_page()
         except Exception as exc:   # noqa: BLE001
@@ -432,10 +574,19 @@ def start(minutes: int) -> tuple[bool, str]:
         _state["started_at"] = time.time()
         _state["plan_min"] = minutes
         _state["last_error"] = ""
-        _state["thread"] = threading.Thread(
-            target=_scroll_loop, args=(minutes,), daemon=True)
+        _state["ai_failures"] = 0
+        _state["ai_mode"] = bool(ai_client)
+        _state["ai_client"] = ai_client
+        loop = _ai_scroll_loop if ai_client else _scroll_loop
+        target_args = (minutes, ai_client) if ai_client else (minutes,)
+        _state["thread"] = threading.Thread(target=loop, args=target_args,
+                                            daemon=True)
         _state["thread"].start()
         _touch()
+        if ai_client:
+            return True, (f"🤖 AI 刷抖音开刷（约 {minutes} 分钟）：AI 看画面决定"
+                          "多看/点赞/关注/划走，每次决策写进日志。"
+                          "AI 连续失败会自动回退随机刷")
         return True, (f"开刷（约 {minutes} 分钟）！浏览器已弹出抖音。"
                       "还没登录过的话：用手机抖音 App 扫一次码，以后全自动。"
                       "想插手随时发：抖音下一个/抖音点赞/抖音评论/抖音截图/抖音帮助")
@@ -448,6 +599,8 @@ def stop() -> tuple[bool, str]:
         thread.join(timeout=5)   # 评审 P1-2.8：等刷视频线程收尾
     _state["thread"] = None
     _state["plan_min"] = 0
+    _state["ai_mode"] = False
+    _state["ai_client"] = None
     with _state["browser_lock"]:
         had = _state["page"] is not None
         _close_page()

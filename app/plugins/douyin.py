@@ -25,6 +25,8 @@ from .. import douyin, plugin_manager
 from .chat import _cmd_gate
 
 cmd_watch = on_command("刷抖音", rule=_cmd_gate, priority=4, block=True)
+cmd_ai_watch = on_command("AI刷抖音", aliases={"ai刷抖音", "Ai刷抖音"},
+                          rule=_cmd_gate, priority=4, block=True)
 cmd_stop = on_command("停止抖音", aliases={"停止刷抖音"},
                       rule=_cmd_gate, priority=4, block=True)
 cmd_pause = on_command("抖音暂停", rule=_cmd_gate, priority=4, block=True)
@@ -68,6 +70,14 @@ async def _(matcher, event: MessageEvent, args: Message = CommandArg()):  # noqa
     text = args.extract_plain_text().strip()
     minutes = int(text) if text.isdigit() else 30
     await _run(matcher, douyin.start, minutes)
+
+
+@cmd_ai_watch.handle()
+async def _(matcher, event: MessageEvent, args: Message = CommandArg()):  # noqa: B008
+    await _guard(matcher, event)
+    text = args.extract_plain_text().strip()
+    minutes = int(text) if text.isdigit() else 10
+    await _run(matcher, douyin.start, minutes, True)
 
 
 @cmd_stop.handle()
@@ -146,7 +156,8 @@ async def _(matcher, event: MessageEvent):
 async def _(matcher, event: MessageEvent):
     await matcher.finish(
         "🎬 抖音遥控·指令表（管理员）\n"
-        "· 刷抖音 [分钟] —— 开刷（随机停留/滑动/翻评论/逛主页/概率点赞）\n"
+        "· AI刷抖音 [分钟] —— AI 看画面决定 看多久/点赞/关注/划走（需多模态模型）\n"
+        "· 刷抖音 [分钟] —— 随机模式开刷（停留/翻评论/逛主页/概率点赞）\n"
         "· 抖音暂停 / 抖音继续 —— 暂停滑动但浏览器保留，可随时插手\n"
         "· 抖音下一个 —— 划走这条\n"
         "· 抖音点赞 / 抖音关注 —— 互动当前视频/作者\n"
