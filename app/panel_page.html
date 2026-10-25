@@ -113,6 +113,7 @@ pre{background:#0f172a;color:#bbf7d0;font-size:12px;padding:14px;border-radius:1
  <div class="nav" data-p="sched" onclick="nav('sched')">⏰ 定时任务</div>
  <div class="nav" data-p="run" onclick="nav('run')">🚀 运行控制</div>
  <div class="nav" data-p="log" onclick="nav('log')">📜 运行日志</div>
+ <div class="nav" data-p="proxy" onclick="nav('proxy')">🔀 反代</div>
  <div class="nav" data-p="guide" onclick="nav('guide')">📖 使用教程</div>
  <div class="nav" onclick="window.open('https://pd.qq.com/s/7hbug91t7?b=5','_blank')"
       title="加入 gudum 交流频道">💬 交流频道 ↗</div>
@@ -154,6 +155,7 @@ pre{background:#0f172a;color:#bbf7d0;font-size:12px;padding:14px;border-radius:1
  <div class="page" id="pg-model">
   <div class="card">
    <h3>🧠 模型提供商</h3>
+   <div class="tip" id="proxy-banner" style="display:none"></div>
    <div class="desc">点一下自动填好地址和推荐模型（学习 AstrBot「模型提供商」页的做法）</div>
    <div class="provs" id="provs"></div>
    <div class="tip" id="live-prov" style="margin-top:10px"></div>
@@ -318,7 +320,33 @@ pre{background:#0f172a;color:#bbf7d0;font-size:12px;padding:14px;border-radius:1
 
 > 只用现有 class（card / step / pl-item / tip / desc / row / button），不含 JS/API。
 
-<!-- 使用教程 -->
+ <!-- 反代 -->
+ <div class="page" id="pg-proxy">
+  <div class="card">
+   <h3>🔀 反代 · WorkBuddy 网关</h3>
+   <div class="desc" id="px-state">状态加载中…</div>
+   <div class="row">
+    <button class="green" id="px-start" onclick="pxStart()">🚀 启动并接入</button>
+    <button class="red" id="px-stop" onclick="pxStop()">⏹ 停止并切回直连</button>
+    <button class="ghost" onclick="window.open('http://127.0.0.1:8788/','_blank')">📊 WorkBuddy 看板</button>
+   </div>
+   <div class="msg" id="px-msg"></div>
+  </div>
+  <div class="card">
+   <h3>⚙️ 设置</h3>
+   <label>WorkBuddy 路径（含 wb_proxy.py）</label><input id="px-path">
+   <label>端口</label><input id="px-port">
+   <label>模型（启动后从 /v1/models 拉取，也可手动填）</label>
+   <select id="px-model"></select>
+   <input id="px-model-manual" placeholder="或手动填模型名" style="margin-top:8px">
+   <label>API Key（留空 = 自动读 WorkBuddy 的 settings.json）</label>
+   <input id="px-key" type="password" placeholder="自动读取">
+   <div class="row"><button class="green" onclick="saveProxyCfg()">💾 保存设置</button></div>
+   <div class="tip">模型源与直连互斥：反代接入后，模型配置页的直连保存只存档不激活；停止反代自动切回。</div>
+  </div>
+ </div>
+
+ <!-- 使用教程 -->
 <div class="page" id="pg-guide">
   <div class="card">
     <h3>⚡ 第一次使用（约 10–20 分钟，以后每次 1 分钟）</h3>
@@ -421,7 +449,7 @@ let PRESETS={},PROFILES={},curProv='',liveProv='';
 
 /* ---------- 导航 ---------- */
 const TITLES={home:'总览',model:'模型配置',persona:'人设管理',plugin:'插件',
- jailbreak:'破甲',sched:'定时任务',run:'运行控制',log:'运行日志',guide:'使用教程'};
+ proxy:'反代',jailbreak:'破甲',sched:'定时任务',run:'运行控制',log:'运行日志',guide:'使用教程'};
 function nav(p){document.querySelectorAll('.nav').forEach(e=>e.classList.toggle('on',e.dataset.p===p));
  document.querySelectorAll('.page').forEach(e=>e.classList.toggle('on',e.id==='pg-'+p));
  $('page-title').textContent=TITLES[p]}
@@ -470,6 +498,10 @@ async function refresh(){
              :'二维码已过期，点「🔄 刷新二维码」生成新的')
      :'等待二维码生成…';
   }else $('qr-tip').textContent=S.qq_connected?'✅ QQ 已登录，二维码已隐藏':'';
+  const pb=$('proxy-banner');
+  if(pb){const on=typeof PX!=='undefined'&&PX.status&&PX.status.active;
+   pb.style.display=on?'block':'none';
+   if(on)pb.textContent='🔀 反代运行中——直连配置的保存只存档不激活；停止反代后自动生效';}
   $('foot-dot').style.background=(S.bot_running&&S.qq_connected)?'#22c55e':(S.bot_running?'#eab308':'#94a3b8');
   $('foot-txt').textContent=S.qq_connected?'一切正常':(S.bot_running?'等待 QQ 连接':'机器人离线');
  }catch(e){}}
@@ -813,8 +845,49 @@ async function schedToggle(name,en){
  if(j.tasks)SC.tasks=j.tasks;
  renderSched()}
 
+/* ---------- 反代 ---------- */
+let PX={status:{},config:{},models:[]},pxBusy=false;
+async function loadProxy(){
+ try{PX=await(await fetch('/api/proxy')).json();renderProxy()}catch(e){}}
+function renderProxy(){
+ const s=PX.status||{};
+ $('px-state').textContent=s.running
+  ?('✅ 反代运行中（端口 '+s.port+(s.external?'，外部启动':'')+'）· 模型源：'+(s.active?'反代 ✅':'直连'))
+  :'⏹ 反代未运行（可在 WorkBuddy 目录手动启动，或点上方按钮）';
+ const sel=$('px-model');const cur=PX.config.model||'';
+ const names=Array.from(new Set([...(PX.models||[]),cur].filter(Boolean)));
+ sel.innerHTML='';names.forEach(m=>{const o=document.createElement('option');
+  o.value=m;o.textContent=m;if(m===cur)o.selected=true;sel.appendChild(o)});
+ if(!names.length){const o=document.createElement('option');o.value='';o.textContent='（启动后自动拉取）';sel.appendChild(o)}
+ $('px-path').value=PX.config.path||'';$('px-port').value=PX.config.port||''}
+async function pxStart(){if(pxBusy)return;pxBusy=true;
+ msg('px-msg','⏳ 正在启动反代并接入（含内核重启，QQ 瞬断几秒）…','');
+ try{const j=await(await fetch('/api/proxy/start',{method:'POST',
+  headers:{'Content-Type':'application/json'},body:'{}'})).json();
+  if(j.ok){msg('px-msg','✅ '+((j.activated?'已接入，当前模型：'+j.model:j.note||'已启动')+
+   (j.restarted?'（内核已重启）':'')),'ok');
+   if(j.models&&j.models.length){PX.models=j.models;renderProxy()}}
+  else msg('px-msg','❌ '+(j.error||'失败'),'err')}
+ finally{pxBusy=false;loadProxy()}}
+async function pxStop(){if(pxBusy)return;pxBusy=true;
+ try{const j=await(await fetch('/api/proxy/stop',{method:'POST',
+  headers:{'Content-Type':'application/json'},body:'{}'})).json();
+  msg('px-msg',(j.ok?'✅ ':'❌ ')+(j.detail||j.error||''),j.ok?'ok':'err');
+  loadProxy()}finally{pxBusy=false}}
+async function saveProxyCfg(){
+ await fetch('/api/proxy/config',{method:'POST',headers:{'Content-Type':'application/json'},
+  body:JSON.stringify({path:$('px-path').value,port:$('px-port').value,
+   api_key:$('px-key').value})});
+ msg('px-msg','✅ 设置已保存','ok');loadProxy()}
+async function applyProxyModel(){
+ const m=$('px-model-manual').value||$('px-model').value;
+ if(!m){msg('px-msg','先选或填模型名','err');return}
+ const j=await(await fetch('/api/proxy/model',{method:'POST',
+  headers:{'Content-Type':'application/json'},body:JSON.stringify({model:m})})).json();
+ msg('px-msg',j.ok?'✅ 模型已应用：'+m+(j.restarted?'（内核已重启）':''):'❌ '+(j.error||''),j.ok?'ok':'err');
+ loadCfg(true)}
 loadProviders().then(()=>loadCfg(true));loadPersonas();loadPlugins();loadJailbreak();
 loadSched();refresh();loadLogs();
-setInterval(refresh,3000);setInterval(loadLogs,5000);setInterval(pollPersonaName,15000);
+setInterval(refresh,3000);setInterval(loadLogs,5000);setInterval(pollPersonaName,15000);setInterval(loadProxy,5000);
 </script><div id="toast"></div>
 </body></html>
