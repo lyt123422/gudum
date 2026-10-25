@@ -620,6 +620,78 @@ async def api_persona_delete(request: Request) -> dict:
     return {"ok": True}
 
 
+# ---------- 定时任务（面板配置端，增删改查走插件自身的状态文件） ----------
+
+def _schedule_mod():
+    """延迟导入：内核插件模块带 nonebot 依赖，面板单独运行时不该被拖崩。"""
+    from .plugins import schedule
+    return schedule
+
+
+@app.get("/api/schedule")
+async def api_schedule() -> dict:
+    try:
+        mod = _schedule_mod()
+    except Exception as exc:
+        return {"ok": False, "error": f"定时任务模块不可用：{exc}", "tasks": []}
+    return {"ok": True, **await asyncio.to_thread(mod.plugin_status)}
+
+
+@app.post("/api/schedule/save")
+async def api_schedule_save(request: Request) -> dict:
+    body = await _body_json(request)
+    name = str(body.get("name") or "").strip()
+    cron = str(body.get("cron") or "").strip()
+    content = str(body.get("content") or "").strip()
+    target = str(body.get("target") or "").strip()
+    task_type = "private" if str(body.get("type")) == "private" else "group"
+    enabled = bool(body.get("enabled", True))
+    # 前端已剥前缀，但直接调 API / 手工填表也可能带，服务端再兜一层
+    if target.lower().startswith("friend:"):
+        task_type, target = "private", target.split(":", 1)[1].strip()
+    try:
+        mod = _schedule_mod()
+    except Exception as exc:
+        return {"ok": False, "error": f"定时任务模块不可用：{exc}"}
+    if name and any(t["name"] == name for t in await asyncio.to_thread(mod._load)):
+        ok, msg = await asyncio.to_thread(
+            mod.update_task, name, cron=cron, content=content,
+            target=target, type=task_type, enabled=enabled)
+    else:
+        ok, msg = await asyncio.to_thread(
+            mod.add_task, name, cron, content, target, task_type, enabled)
+    # 保存即确保调度器在跑（面板侧没有内核事件循环时 add_task 仍可用）
+    return {"ok": ok, "error": "" if ok else msg, "msg": msg,
+            "tasks": await asyncio.to_thread(lambda: mod.plugin_status()["tasks"])}
+
+
+@app.post("/api/schedule/delete")
+async def api_schedule_delete(request: Request) -> dict:
+    body = await _body_json(request)
+    name = str(body.get("name") or "").strip()
+    try:
+        mod = _schedule_mod()
+    except Exception as exc:
+        return {"ok": False, "error": f"定时任务模块不可用：{exc}"}
+    ok, msg = await asyncio.to_thread(mod.remove_task, name)
+    return {"ok": ok, "error": "" if ok else msg, "msg": msg,
+            "tasks": await asyncio.to_thread(lambda: mod.plugin_status()["tasks"])}
+
+
+@app.post("/api/schedule/toggle")
+async def api_schedule_toggle(request: Request) -> dict:
+    body = await _body_json(request)
+    name = str(body.get("name") or "").strip()
+    enabled = bool(body.get("enabled"))
+    try:
+        mod = _schedule_mod()
+    except Exception as exc:
+        return {"ok": False, "error": f"定时任务模块不可用：{exc}"}
+    ok, msg = await asyncio.to_thread(mod.set_enabled, name, enabled)
+    return {"ok": ok, "error": "" if ok else msg, "msg": msg,
+            "tasks": await asyncio.to_thread(lambda: mod.plugin_status()["tasks"])}
+
+
 @app.post("/api/bot/start")
 async def api_bot_start() -> dict:
     # taskkill/netstat 等阻塞调用放线程池，不卡事件循环（保存卡死事故的同款教训）

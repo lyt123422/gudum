@@ -9,6 +9,7 @@ import io
 import os
 import tempfile
 import threading
+import time
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -731,6 +732,310 @@ class TestDouyinSharesState(unittest.TestCase):
 def assistant_state_snapshot():
     from app import assistant_state
     return assistant_state.snapshot()
+
+
+class _ScheduleIsolated:
+    """把定时任务的状态文件与调度器隔离到临时目录，绝不碰 data/。"""
+
+    def setUp(self):
+        import nonebot
+        try:
+            nonebot.init()
+        except Exception:
+            pass
+        self._tmp = tempfile.TemporaryDirectory()
+        self.tmp = Path(self._tmp.name)
+        from app.plugins import schedule
+        self.sched = schedule
+        patches = [mock.patch.object(schedule, "STATE_FILE",
+                                     self.tmp / "schedules.json"),
+                   mock.patch.object(schedule, "SCHEDULE_ENABLED", True)]
+        for p in patches:
+            p.start()
+        self.addCleanup(lambda: [p.stop() for p in patches])
+        self.addCleanup(schedule.stop_worker)
+        self.addCleanup(self._tmp.cleanup)
+        self._reset_cache()
+
+    def _reset_cache(self):
+        self.sched._cache.update(at=0.0, tasks=None)
+
+
+class TestScheduleCron(_ScheduleIsolated, unittest.TestCase):
+    """cron 解析与中文说明。"""
+
+    def test_valid_and_invalid(self):
+        self.assertTrue(self.sched.cron_valid("0 9 * * 1-5"))
+        self.assertTrue(self.sched.cron_valid("*/5 * * * *"))
+        self.assertTrue(self.sched.cron_valid("30 8 * * 6,0"))
+        self.assertFalse(self.sched.cron_valid("99 9 * * *"))    # 分钟越界
+        self.assertFalse(self.sched.cron_valid("0 25 * * *"))    # 小时越界
+        self.assertFalse(self.sched.cron_valid("0 9 * *"))       # 段数不足
+        self.assertFalse(self.sched.cron_valid("*/0 * * * *"))   # 步长 0
+        self.assertFalse(self.sched.cron_valid(""))              # 空
+
+    def test_describe(self):
+        self.assertEqual(self.sched.describe_cron("* * * * *"), "每分钟")
+        self.assertEqual(self.sched.describe_cron("30 8 * * *"), "每天 08:30")
+        self.assertEqual(self.sched.describe_cron("*/10 * * * *"), "每 10 分钟")
+        self.assertIn("周一二三四五", self.sched.describe_cron("0 9 * * 1-5"))
+        self.assertIn("格式不对", self.sched.describe_cron("x y z w v"))
+
+    def test_matches_weekday_only(self):
+        """1-5 只在工作日命中；cron 的 0 是周日。"""
+        fields = self.sched.cron_fields("0 9 * * 1-5")
+        mon9 = time.struct_time((2026, 10, 26, 9, 0, 0, 0, 1, 0))    # 周一
+        sat9 = time.struct_time((2026, 10, 31, 9, 0, 0, 5, 1, 0))    # 周六
+        mon10 = time.struct_time((2026, 10, 26, 10, 0, 0, 0, 1, 0))
+        self.assertTrue(self.sched._cron_matches(fields, mon9))
+        self.assertFalse(self.sched._cron_matches(fields, sat9))
+        self.assertFalse(self.sched._cron_matches(fields, mon10))
+        # 6,0 = 周六 + 周日
+        weekend = self.sched.cron_fields("0 9 * * 6,0")
+        sun9 = time.struct_time((2026, 10, 25, 9, 0, 0, 6, 1, 0))
+        self.assertTrue(self.sched._cron_matches(weekend, sun9))
+        self.assertTrue(self.sched._cron_matches(weekend, sat9))
+        self.assertFalse(self.sched._cron_matches(weekend, mon9))
+
+
+class TestScheduleCrud(_ScheduleIsolated, unittest.TestCase):
+    """增删改查 + 参数校验（不写真实 data/）。"""
+
+    def test_add_then_list(self):
+        ok, msg = self.sched.add_task("早报", "0 9 * * 1-5", "大家早！", "123456")
+        self.assertTrue(ok, msg)
+        self.assertIn("早报", msg)
+        tasks = self.sched._load()
+        self.assertEqual(len(tasks), 1)
+        self.assertEqual(tasks[0]["target"], "123456")
+        self.assertEqual(tasks[0]["type"], "group")
+        self.assertIn("早报", self.sched.list_text())
+
+    def test_add_rejects_bad_input(self):
+        self.assertFalse(self.sched.add_task("", "* * * * *", "x", "1")[0])
+        self.assertFalse(self.sched.add_task("n", "bogus", "x", "1")[0])
+        self.assertFalse(self.sched.add_task("n", "* * * * *", "", "1")[0])
+        self.assertFalse(self.sched.add_task("n", "* * * * *", "x", "abc")[0])
+        self.assertFalse(self.sched.add_task("n", "* * * * *", "x", "-5")[0])
+        self.assertFalse(self.sched.add_task("n", "* * * * *", "x" * 501, "1")[0])
+        self.assertEqual(self.sched._load(), [])
+
+    def test_add_dedupes_by_name(self):
+        self.sched.add_task("早报", "0 9 * * *", "第一版", "1")
+        self.sched.add_task("早报", "0 10 * * *", "第二版", "2")
+        tasks = self.sched._load()
+        self.assertEqual(len(tasks), 1)
+        self.assertEqual(tasks[0]["content"], "第二版")
+
+    def test_max_tasks_cap(self):
+        for i in range(self.sched.MAX_TASKS + 5):
+            self.sched.add_task(f"t{i}", "0 9 * * *", "x", "1")
+        self.assertLessEqual(len(self.sched._load()), self.sched.MAX_TASKS)
+
+    def test_update_and_toggle(self):
+        self.sched.add_task("早报", "0 9 * * *", "旧内容", "111")
+        ok, _ = self.sched.update_task("早报", content="新内容", cron="0 10 * * *")
+        self.assertTrue(ok)
+        task = self.sched._load()[0]
+        self.assertEqual(task["content"], "新内容")
+        self.assertEqual(task["cron"], "0 10 * * *")
+        ok, msg = self.sched.set_enabled("早报", False)
+        self.assertTrue(ok)
+        self.assertFalse(self.sched._load()[0]["enabled"])
+        # 改出非法 cron 要被拒，且原值不被破坏
+        ok, msg = self.sched.update_task("早报", cron="99 9 * * *")
+        self.assertFalse(ok)
+        self.assertEqual(self.sched._load()[0]["cron"], "0 10 * * *")
+        self.assertFalse(self.sched.update_task("不存在", content="x")[0])
+        self.assertFalse(self.sched.remove_task("不存在")[0])
+        self.assertTrue(self.sched.remove_task("早报")[0])
+        self.assertEqual(self.sched._load(), [])
+
+    def test_private_target(self):
+        self.sched.add_task("提醒", "30 8 * * *", "起床", "10001", "private")
+        self.assertEqual(self.sched._load()[0]["type"], "private")
+
+
+class TestScheduleDispatch(_ScheduleIsolated, unittest.TestCase):
+    """到期判定与发送（Bot 全 mock，绝不真连 QQ）。"""
+
+    def _fake_bot(self, fail=False):
+        sent = []
+
+        class FakeBot:
+            async def send_group_msg(self, group_id, message):
+                if fail:
+                    raise RuntimeError("Ban state forbit write req")
+                sent.append(("group", str(group_id), message))
+
+            async def send_private_msg(self, user_id, message):
+                if fail:
+                    raise RuntimeError("send failed")
+                sent.append(("private", str(user_id), message))
+
+        return FakeBot(), sent
+
+    def test_due_once_per_minute(self):
+        """同一分钟内多次 tick 只发一次（去重靠 last_run 分钟标记）。"""
+        self.sched.add_task("整分", "* * * * *", "每分钟一条", "777")
+        bot, sent = self._fake_bot()
+        now = time.mktime(time.struct_time((2026, 10, 26, 9, 0, 0, 0, 1, 0)))
+        with mock.patch.object(self.sched, "get_bot", lambda: bot):
+            self.assertEqual(asyncio.run(self.sched._tick_once(now)), 1)
+            self.assertEqual(asyncio.run(self.sched._tick_once(now)), 0)
+            self.assertEqual(asyncio.run(self.sched._tick_once(now)), 0)
+        self.assertEqual(len(sent), 1)
+        self.assertEqual(sent[0][1], "777")
+
+    def test_not_due_outside_cron(self):
+        self.sched.add_task("早报", "0 9 * * *", "早", "777")
+        bot, sent = self._fake_bot()
+        # 同一天的 10:00，不该触发
+        now = time.mktime(time.struct_time((2026, 10, 26, 10, 0, 0, 0, 1, 0)))
+        with mock.patch.object(self.sched, "get_bot", lambda: bot):
+            self.assertEqual(asyncio.run(self.sched._tick_once(now)), 0)
+        self.assertEqual(sent, [])
+
+    def test_disabled_task_never_sends(self):
+        self.sched.add_task("关掉的", "* * * * *", "不该发", "777")
+        self.sched.set_enabled("关掉的", False)
+        bot, sent = self._fake_bot()
+        now = time.mktime(time.struct_time((2026, 10, 26, 9, 0, 0, 0, 1, 0)))
+        with mock.patch.object(self.sched, "get_bot", lambda: bot):
+            self.assertEqual(asyncio.run(self.sched._tick_once(now)), 0)
+        self.assertEqual(sent, [])
+
+    def test_send_failure_is_not_fatal(self):
+        """QQ 风控/号码错误：记 last_error，调度器继续跑，不抛异常。"""
+        self.sched.add_task("风控", "* * * * *", "会被拦", "777")
+        bot, sent = self._fake_bot(fail=True)
+        now = time.mktime(time.struct_time((2026, 10, 26, 9, 0, 0, 0, 1, 0)))
+        with mock.patch.object(self.sched, "get_bot", lambda: bot):
+            self.assertEqual(asyncio.run(self.sched._tick_once(now)), 0)
+        task = self.sched._load()[0]
+        self.assertFalse(task["last_ok"])
+        self.assertTrue(task["last_error"])
+
+    def test_schedule_enabled_off_blocks_all(self):
+        self.sched.add_task("整分", "* * * * *", "x", "777")
+        bot, sent = self._fake_bot()
+        now = time.mktime(time.struct_time((2026, 10, 26, 9, 0, 0, 0, 1, 0)))
+        with mock.patch.object(self.sched, "SCHEDULE_ENABLED", False), \
+                mock.patch.object(self.sched, "get_bot", lambda: bot):
+            self.assertEqual(asyncio.run(self.sched._tick_once(now)), 0)
+        self.assertEqual(sent, [])
+
+    def test_private_dispatch(self):
+        self.sched.add_task("私聊提醒", "* * * * *", "该睡了", "10001", "private")
+        bot, sent = self._fake_bot()
+        now = time.mktime(time.struct_time((2026, 10, 26, 9, 0, 0, 0, 1, 0)))
+        with mock.patch.object(self.sched, "get_bot", lambda: bot):
+            self.assertEqual(asyncio.run(self.sched._tick_once(now)), 1)
+        self.assertEqual(sent[0][0], "private")
+        self.assertEqual(sent[0][1], "10001")
+
+    def test_worker_starts_and_stops(self):
+        """调度器能起来也能停（不 patch 被测函数，只 patch 常量）。"""
+        async def main():
+            self.sched.start_worker()
+            self.assertTrue(self.sched.plugin_status()["running"])
+            await asyncio.sleep(0)
+            self.sched.stop_worker()
+
+        with mock.patch.object(self.sched, "TICK_SECONDS", 0.01):
+            asyncio.run(asyncio.wait_for(main(), timeout=5))
+        self.assertFalse(self.sched.plugin_status()["running"])
+
+
+class TestSchedulePanelApi(unittest.TestCase):
+    """面板 /api/schedule/*：CSRF/Host 防护同样生效（回归安全项）。"""
+
+    def _client(self, tmp: Path):
+        from fastapi.testclient import TestClient
+        from app import panel
+        from app.plugins import schedule
+        state = tmp / "schedules.json"
+        patches = [mock.patch.object(panel, "ENV_FILE", tmp / ".env"),
+                   mock.patch.object(schedule, "STATE_FILE", state)]
+        for p in patches:
+            p.start()
+        self.addCleanup(lambda: [p.stop() for p in patches])
+        self.addCleanup(schedule.stop_worker)
+        return TestClient(panel.app, base_url="http://127.0.0.1:8090")
+
+    def test_crud_and_security(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            client = self._client(Path(tmp))
+            r = client.get("/api/schedule")
+            self.assertTrue(r.json()["ok"])
+            self.assertEqual(r.json()["tasks"], [])
+
+            r = client.post("/api/schedule/save",
+                            json={"name": "早报", "cron": "0 9 * * 1-5",
+                                  "content": "大家早", "target": "123456",
+                                  "type": "group", "enabled": True})
+            self.assertTrue(r.json()["ok"], r.json())
+            self.assertEqual(len(r.json()["tasks"]), 1)
+            self.assertIn("周一二三四五", r.json()["tasks"][0]["describe"])
+
+            # 同名再存 = 更新，不是新增
+            r = client.post("/api/schedule/save",
+                            json={"name": "早报", "cron": "0 10 * * *",
+                                  "content": "改内容", "target": "123456"})
+            self.assertTrue(r.json()["ok"])
+            self.assertEqual(len(r.json()["tasks"]), 1)
+            self.assertEqual(r.json()["tasks"][0]["content"], "改内容")
+
+            r = client.post("/api/schedule/toggle",
+                            json={"name": "早报", "enabled": False})
+            self.assertTrue(r.json()["ok"])
+            self.assertFalse(r.json()["tasks"][0]["enabled"])
+
+            # 非法 cron 必须 400 级业务失败，不能静默写坏
+            r = client.post("/api/schedule/save",
+                            json={"name": "坏任务", "cron": "99 9 * * *",
+                                  "content": "x", "target": "1"})
+            self.assertFalse(r.json()["ok"])
+
+            r = client.post("/api/schedule/delete", json={"name": "早报"})
+            self.assertTrue(r.json()["ok"])
+            self.assertEqual(r.json()["tasks"], [])
+
+            # 安全回归：文本 POST / 跨站 Origin 必须被中间件挡下
+            r = client.post("/api/schedule/save", content="{}",
+                            headers={"Content-Type": "text/plain"})
+            self.assertEqual(r.status_code, 415)
+            r = client.post("/api/schedule/save", json={"name": "x"},
+                            headers={"Origin": "http://evil.example"})
+            self.assertEqual(r.status_code, 403)
+
+    def test_friend_prefix_resolved_server_side(self):
+        """面板已剥前缀，但直接调 API 带 friend: 时服务端必须自己认（不能存成群号）。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            client = self._client(Path(tmp))
+            r = client.post("/api/schedule/save",
+                            json={"name": "提醒", "cron": "30 8 * * *",
+                                  "content": "该起床了", "target": "friend:10001"})
+            self.assertTrue(r.json()["ok"], r.json())
+            task = r.json()["tasks"][0]
+            self.assertEqual(task["type"], "private")
+            self.assertEqual(task["target"], "10001")
+
+
+class TestScheduleBuiltin(unittest.TestCase):
+    """插件注册：BUILTIN 里有 schedule 且默认开启。"""
+
+    def test_registered(self):
+        from app import plugin_manager
+        ids = {b["id"] for b in plugin_manager.BUILTIN}
+        self.assertIn("schedule", ids)
+        entry = next(b for b in plugin_manager.BUILTIN if b["id"] == "schedule")
+        self.assertTrue(entry["default"])
+        # 未写状态文件时按 default 判定
+        with tempfile.TemporaryDirectory() as tmp:
+            with mock.patch.object(plugin_manager, "STATE_FILE",
+                                   Path(tmp) / "plugins.json"):
+                self.assertTrue(plugin_manager.is_enabled("schedule"))
 
 
 class TestRestartDelayTerminates(unittest.TestCase):

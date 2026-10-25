@@ -109,6 +109,7 @@ pre{background:#0f172a;color:#bbf7d0;font-size:12px;padding:14px;border-radius:1
  <div class="nav" data-p="model" onclick="nav('model')">🧠 模型配置</div>
  <div class="nav" data-p="persona" onclick="nav('persona')">🎭 人设管理</div>
  <div class="nav" data-p="plugin" onclick="nav('plugin')">🧩 插件</div>
+ <div class="nav" data-p="sched" onclick="nav('sched')">⏰ 定时任务</div>
  <div class="nav" data-p="run" onclick="nav('run')">🚀 运行控制</div>
  <div class="nav" data-p="log" onclick="nav('log')">📜 运行日志</div>
  <div class="nav" data-p="guide" onclick="nav('guide')">📖 使用教程</div>
@@ -230,6 +231,33 @@ pre{background:#0f172a;color:#bbf7d0;font-size:12px;padding:14px;border-radius:1
   </div>
  </div>
 
+ <!-- 定时任务 -->
+ <div class="page" id="pg-sched">
+  <div class="card">
+   <h3>⏰ 定时任务</h3>
+   <div class="desc">配好 cron 和内容，机器人到点自动往指定群/好友发消息。管理员专属。</div>
+   <div class="tip">cron 五段式：<b>分 时 日 月 周</b>。常用：<code>0 9 * * 1-5</code>=工作日 9:00；<code>*/30 * * * *</code>=每 30 分钟；<code>30 8 * * *</code>=每天 8:30。周字段 0=周日。</div>
+   <div class="row" style="flex-wrap:wrap;gap:8px">
+    <input id="sc-name" placeholder="任务名（如 早报）" style="max-width:160px">
+    <input id="sc-cron" placeholder="cron：0 9 * * 1-5" style="max-width:150px">
+    <input id="sc-content" placeholder="到点要发的内容" style="flex:1;min-width:180px">
+    <input id="sc-target" placeholder="群号 或 friend:QQ号" style="max-width:150px">
+    <button class="green" onclick="schedSave()">💾 保存</button>
+   </div>
+   <div class="tip" id="sc-msg"></div>
+  </div>
+  <div class="card">
+   <h3>📋 任务列表</h3>
+   <div class="desc" id="sc-state">加载中…</div>
+   <div id="sc-list">加载中…</div>
+  </div>
+  <div class="card">
+   <h3>💬 QQ 里也能配</h3>
+   <div class="tip">私聊或群里 @机器人 发：<code>定时任务 添加 早报 | 0 9 * * 1-5 | 大家早！ | 123456</code><br>
+    <code>定时任务 列表</code> · <code>定时任务 删除 早报</code> · <code>定时任务 立即 早报</code>（先测一下能不能发）</div>
+  </div>
+ </div>
+
 
 
 > 只用现有 class（card / step / pl-item / tip / desc / row / button），不含 JS/API。
@@ -336,7 +364,8 @@ document.addEventListener('click',e=>{const b=e.target.closest('button');
 let PRESETS={},PROFILES={},curProv='',liveProv='';
 
 /* ---------- 导航 ---------- */
-const TITLES={home:'总览',model:'模型配置',persona:'人设管理',plugin:'插件',run:'运行控制',log:'运行日志',guide:'使用教程'};
+const TITLES={home:'总览',model:'模型配置',persona:'人设管理',plugin:'插件',
+ sched:'定时任务',run:'运行控制',log:'运行日志',guide:'使用教程'};
 function nav(p){document.querySelectorAll('.nav').forEach(e=>e.classList.toggle('on',e.dataset.p===p));
  document.querySelectorAll('.page').forEach(e=>e.classList.toggle('on',e.id==='pg-'+p));
  $('page-title').textContent=TITLES[p]}
@@ -614,7 +643,73 @@ async function uninstallPlugin(pip){
  msg('pl-msg',j.ok?'🗑 已卸载':'❌ '+(j.error||'卸载失败'),j.ok?'ok':'err');
  loadPlugins()}
 
-loadProviders().then(()=>loadCfg(true));loadPersonas();loadPlugins();refresh();loadLogs();
+/* ---------- 定时任务 ---------- */
+let SC={tasks:[],running:false};
+async function loadSched(){
+ try{SC=await(await fetch('/api/schedule')).json();
+  if(!SC.ok){$('sc-state').textContent=SC.error||'定时任务不可用';return}
+  renderSched()}catch(e){$('sc-state').textContent='定时任务加载失败'}}
+function renderSched(){
+ const box=$('sc-list');box.innerHTML='';
+ $('sc-state').textContent=SC.running
+  ? ('共 '+SC.tasks.length+' 个任务 · 调度器运行中')
+  : ('共 '+SC.tasks.length+' 个任务 · 调度器未运行（内核没启动，或插件/总开关已关）');
+ if(!SC.tasks.length){box.textContent='（还没有定时任务，上面填一条保存试试）';return}
+ SC.tasks.forEach(t=>{
+  const row=document.createElement('div');row.className='pl-item';
+  const left=document.createElement('div');
+  const nm=document.createElement('div');nm.className='nm';
+  nm.textContent=(t.enabled?'🟢 ':'⚪ ')+t.name;
+  if(!t.enabled){const c=document.createElement('span');c.className='cat';c.textContent='已关闭';nm.append(c)}
+  const ds=document.createElement('div');ds.className='ds';
+  ds.textContent=t.describe+' → '+(t.type==='private'?'好友 ':'群 ')+t.target
+   +(t.last_error?(' · 上次失败：'+t.last_error):'');
+  left.append(nm,ds);row.append(left);
+  const btns=document.createElement('div');btns.className='pl-btns';
+  const tg=document.createElement('button');
+  tg.className=t.enabled?'green':'ghost';tg.textContent=t.enabled?'已开启':'已关闭';
+  tg.onclick=()=>schedToggle(t.name,!t.enabled);
+  const ed=document.createElement('button');ed.textContent='✏️ 编辑';
+  ed.onclick=()=>schedEdit(t);
+  const rm=document.createElement('button');rm.className='red';rm.textContent='删除';
+  rm.onclick=()=>schedDelete(t.name);
+  btns.append(tg,ed,rm);row.append(btns);box.append(row)})}
+function schedEdit(t){   // 填回表单，改完点保存即覆盖同名任务
+ $('sc-name').value=t.name||'';$('sc-cron').value=t.cron||'';
+ $('sc-content').value=t.content||'';
+ $('sc-target').value=(t.type==='private'?'friend:':'')+(t.target||'');
+ msg('sc-msg','✏️ 已填入「'+t.name+'」，改完点 💾 保存','')}
+async function schedSave(){
+ const body={name:$('sc-name').value.trim(),cron:$('sc-cron').value.trim(),
+  content:$('sc-content').value.trim(),target:$('sc-target').value.trim(),
+  enabled:true};
+ if(!body.name||!body.cron||!body.content||!body.target){
+  msg('sc-msg','❌ 名字 / cron / 内容 / 目标 都要填','err');return}
+ let type='group';
+ if(body.target.toLowerCase().startsWith('friend:')){type='private';body.target=body.target.slice(7).trim()}
+ body.type=type;
+ const j=await(await fetch('/api/schedule/save',{method:'POST',
+  headers:{'Content-Type':'application/json'},body:JSON.stringify(body)})).json();
+ msg('sc-msg',j.ok?('✅ '+(j.msg||'已保存')):('❌ '+(j.error||'保存失败')),j.ok?'ok':'err');
+ if(j.ok){$('sc-name').value='';$('sc-cron').value='';$('sc-content').value='';$('sc-target').value=''}
+ if(j.tasks)SC.tasks=j.tasks;
+ renderSched()}
+async function schedDelete(name){
+ if(!confirm('确定删除定时任务「'+name+'」？'))return;
+ const j=await(await fetch('/api/schedule/delete',{method:'POST',
+  headers:{'Content-Type':'application/json'},body:JSON.stringify({name:name})})).json();
+ msg('sc-msg',j.ok?'🗑 已删除':'❌ '+(j.error||'删除失败'),j.ok?'ok':'err');
+ if(j.tasks)SC.tasks=j.tasks;
+ renderSched()}
+async function schedToggle(name,en){
+ const j=await(await fetch('/api/schedule/toggle',{method:'POST',
+  headers:{'Content-Type':'application/json'},
+  body:JSON.stringify({name:name,enabled:en})})).json();
+ if(j.tasks)SC.tasks=j.tasks;
+ renderSched()}
+
+loadProviders().then(()=>loadCfg(true));loadPersonas();loadPlugins();
+loadSched();refresh();loadLogs();
 setInterval(refresh,3000);setInterval(loadLogs,5000);setInterval(pollPersonaName,15000);
 </script><div id="toast"></div>
 </body></html>

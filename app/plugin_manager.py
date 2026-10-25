@@ -29,6 +29,9 @@ BUILTIN: list[dict] = [
     {"id": "douyin", "name": "抖音真机",
      "desc": "QQ 遥控安卓手机真刷抖音（真滑动真声音），AI 看屏幕做决策；"
              "需在市场安装依赖并 USB 连接手机", "default": False},
+    {"id": "schedule", "name": "定时任务",
+     "desc": "面板配 cron + 消息内容，机器人到点自动往指定群/好友发（管理员）",
+     "default": True},
 ]
 
 # 精选市场（pip 包名务必真实存在；描述里写清"装完怎么用"，不装糊涂账）
