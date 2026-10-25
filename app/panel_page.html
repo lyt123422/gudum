@@ -337,7 +337,7 @@ pre{background:#0f172a;color:#bbf7d0;font-size:12px;padding:14px;border-radius:1
    <label>WorkBuddy 路径（含 wb_proxy.py）</label><input id="px-path">
    <label>端口</label><input id="px-port">
    <label>模型（启动后从 /v1/models 拉取，也可手动填）</label>
-   <select id="px-model"></select>
+   <select id="px-model" onchange="applyProxyModel()"></select>
    <input id="px-model-manual" placeholder="或手动填模型名" style="margin-top:8px">
    <label>API Key（留空 = 自动读 WorkBuddy 的 settings.json）</label>
    <input id="px-key" type="password" placeholder="自动读取">
@@ -849,17 +849,22 @@ async function schedToggle(name,en){
 let PX={status:{},config:{},models:[]},pxBusy=false;
 async function loadProxy(){
  try{PX=await(await fetch('/api/proxy')).json();renderProxy()}catch(e){}}
+let pxSig='';
 function renderProxy(){
  const s=PX.status||{};
  $('px-state').textContent=s.running
   ?('✅ 反代运行中（端口 '+s.port+(s.external?'，外部启动':'')+'）· 模型源：'+(s.active?'反代 ✅':'直连'))
   :'⏹ 反代未运行（可在 WorkBuddy 目录手动启动，或点上方按钮）';
- const sel=$('px-model');const cur=PX.config.model||'';
- const names=Array.from(new Set([...(PX.models||[]),cur].filter(Boolean)));
- sel.innerHTML='';names.forEach(m=>{const o=document.createElement('option');
-  o.value=m;o.textContent=m;if(m===cur)o.selected=true;sel.appendChild(o)});
- if(!names.length){const o=document.createElement('option');o.value='';o.textContent='（启动后自动拉取）';sel.appendChild(o)}
- $('px-path').value=PX.config.path||'';$('px-port').value=PX.config.port||''}
+ const cur=PX.config.model||'';
+ const sig=JSON.stringify([PX.models||[],cur]);
+ if(sig!==pxSig){pxSig=sig;   // 评审 v4：数据变了才重建，不再覆盖用户正在选的模型
+  const sel=$('px-model');
+  const names=Array.from(new Set([...(PX.models||[]),cur].filter(Boolean)));
+  sel.innerHTML='';names.forEach(m=>{const o=document.createElement('option');
+   o.value=m;o.textContent=m;if(m===cur)o.selected=true;sel.appendChild(o)});
+  if(!names.length){const o=document.createElement('option');o.value='';o.textContent='（启动后自动拉取）';sel.appendChild(o)}}
+ if(document.activeElement!==$('px-path'))$('px-path').value=PX.config.path||'';
+ if(document.activeElement!==$('px-port'))$('px-port').value=PX.config.port||''}
 async function pxStart(){if(pxBusy)return;pxBusy=true;
  msg('px-msg','⏳ 正在启动反代并接入（含内核重启，QQ 瞬断几秒）…','');
  try{const j=await(await fetch('/api/proxy/start',{method:'POST',

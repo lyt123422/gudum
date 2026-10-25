@@ -210,11 +210,13 @@ class ChatPipelineBase(unittest.TestCase):
         self.chat = chat_mod
         self.captured: list[list[dict]] = []
 
-        async def fake_chat(messages, temperature=None):
+        async def fake_chat(messages, temperature=None, tools=None, tool_executor=None):
             self.captured.append(messages)
             return "好的"
 
         self.chat.client.chat = fake_chat
+        # 工具调用路径也要走同一个离线假客户端，禁止测试打真实 API
+        self.chat.client.chat_with_tools = fake_chat
         body = [
             mock.patch.object(self.chat, "_allow_user", lambda uid: True),
             mock.patch.object(self.chat, "_allow_group", lambda gid: True),
