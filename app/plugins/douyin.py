@@ -18,7 +18,7 @@ from nonebot.params import CommandArg
 from .. import douyin, plugin_manager
 from .chat import _cmd_gate
 
-cmd_connect = on_command("连接手机", priority=4, block=True)
+cmd_connect = on_command("连接手机", rule=_cmd_gate, priority=4, block=True)
 cmd_watch = on_command("刷抖音", rule=_cmd_gate, priority=4, block=True)
 cmd_ai_watch = on_command("AI刷抖音", aliases={"ai刷抖音"},
                           rule=_cmd_gate, priority=4, block=True)

@@ -1,4 +1,5 @@
 """DeepSeek QQ 机器人入口：NoneBot2 + OneBot v11（NapCat 反向 WebSocket 接入）。"""
+import asyncio
 import os
 import time
 from pathlib import Path
@@ -46,7 +47,8 @@ def _register_healthz() -> None:  # 仅本机排障用；HOST 已限定 127.0.0.
         if bots:
             bot = next(iter(bots.values()))
             try:
-                info = await bot.get_login_info()
+                # 评审 v3 P2-21：NapCat 卡住时 healthz 不能被拖死
+                info = await asyncio.wait_for(bot.get_login_info(), timeout=1.0)
                 payload["onebot"]["login_info"] = {
                     "user_id": info.get("user_id"),
                     "nickname": info.get("nickname"),

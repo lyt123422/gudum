@@ -18,23 +18,32 @@ class DeepSeekError(Exception):
 
 
 class DeepSeekClient:
-    def __init__(self, base_url: str, api_key: str, model: str, timeout: float = 60.0):
+    def __init__(self, base_url: str, api_key: str, model: str,
+                 timeout: float = 60.0, max_retries: int = 2,
+                 temperature: float = 0.8):
         self.model = model
+        self.temperature = temperature
         # 空 Key 时填占位值：让请求走出去拿 401，错误信息比构造时报错更友好
         self._client = openai.AsyncOpenAI(
             base_url=base_url or "https://api.deepseek.com",
             api_key=api_key or "EMPTY",
             timeout=timeout,
+            max_retries=max_retries,
         )
 
-    async def chat(self, messages: list[dict]) -> str:
-        """messages: [{"role": "system"|"user"|"assistant", "content": str}]"""
+    async def aclose(self) -> None:
+        """释放连接池（评审 v3 P1-5：每次决策新建的客户端必须关，否则泄漏）。"""
+        await self._client.close()
+
+    async def chat(self, messages: list[dict],
+                   temperature: float | None = None) -> str:
+        """messages: [{"role": "system"|"user"|"assistant", "content": str|list}]"""
         try:
             resp = await self._client.chat.completions.create(
                 model=self.model,
                 messages=messages,  # type: ignore[arg-type]
                 max_tokens=2048,
-                temperature=0.8,
+                temperature=self.temperature if temperature is None else temperature,
                 stream=False,
             )
         except openai.AuthenticationError as exc:

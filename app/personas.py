@@ -226,7 +226,9 @@ def active_name() -> str:
 
 def set_active(name: str) -> None:
     ACTIVE_FILE.parent.mkdir(parents=True, exist_ok=True)
-    ACTIVE_FILE.write_text(name, encoding="utf-8")
+    tmp = ACTIVE_FILE.with_suffix(".tmp")   # 评审 v3 P2-22：原子写
+    tmp.write_text(name, encoding="utf-8")
+    tmp.replace(ACTIVE_FILE)
 
 
 def get_active() -> Persona:

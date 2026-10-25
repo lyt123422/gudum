@@ -23,6 +23,7 @@ from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
 
 from . import personas, plugin_manager
 from .envutil import EnvValueError, load_env, update_env as _env_update
+from .log_setup import redact_log
 
 ROOT = Path(__file__).resolve().parents[1]
 _PAGE_PATH = Path(__file__).resolve().parent / "panel_page.html"
@@ -196,23 +197,33 @@ def _spawn(name: str, module: str, outfile: Path) -> None:
 # ---------- LLM 连通测试 ----------
 
 def _llm_test(base: str, key: str, model: str) -> dict:
+    import logging
     from openai import OpenAI
-    client = OpenAI(base_url=base or "https://api.deepseek.com",
-                    api_key=key or "EMPTY", timeout=20)
     start = time.time()
     try:
+        client = OpenAI(base_url=base or "https://api.deepseek.com",
+                        api_key=key or "EMPTY", timeout=20)
         resp = client.chat.completions.create(
             model=model or "deepseek-chat",
             messages=[{"role": "user", "content": "只回复两个字：正常"}],
             max_tokens=20)
     except Exception as exc:  # noqa: BLE001
-        text = str(exc)
-        hint = ""
-        if "401" in text or "api_key" in text.lower() or "authentication" in text.lower():
-            hint = "（API Key 没填或填错）"
-        elif "402" in text:
-            hint = "（账户余额不足）"
-        return {"ok": False, "error": (text[:300] + hint) if text else "调用失败"}
+        # 评审 v3 P2-8：原始异常可能回显 Key，只回状态码；全文脱敏后进服务端日志
+        raw = str(exc)
+        logging.getLogger("app").warning("连通测试失败: %s", redact_log(raw))
+        status = getattr(exc, "status_code", None)
+        status = status if isinstance(status, int) else None
+        text = raw.lower()
+        if status == 401 or "401" in text or "authentication" in text:
+            return {"ok": False, "error": "API Key 无效（HTTP 401）"}
+        if status == 402 or "402" in text:
+            return {"ok": False, "error": "账户余额不足（HTTP 402）"}
+        if status == 404 or "404" in text:
+            return {"ok": False, "error": "模型名可能不对（HTTP 404）"}
+        if "timed out" in text or "timeout" in text:
+            return {"ok": False, "error": "请求超时（服务无响应）"}
+        return {"ok": False,
+                "error": "调用失败（网络或服务错误），详情已写服务端日志"}
     return {"ok": True, "latency_ms": int((time.time() - start) * 1000),
             "reply": (resp.choices[0].message.content or "").strip()}
 
@@ -233,9 +244,10 @@ async def api_config() -> dict:
     env = load_env(ENV_FILE)
     active = personas.get_active()
     try:
-        su_list = [str(x) for x in json.loads(env.get("SUPERUSERS", "[]"))]
+        parsed = json.loads(env.get("SUPERUSERS", "[]"))
+        su_list = [str(x) for x in parsed] if isinstance(parsed, list) else []
     except ValueError:
-        su_list = [s for s in env.get("SUPERUSERS", "").strip('[]" ').split(",") if s]
+        su_list = []   # 评审 v3 P2-9：写坏的 SUPERUSERS 不再 500
     return {"base_url": env.get("DEEPSEEK_BASE_URL", ""),
             "api_key": _mask(env.get("DEEPSEEK_API_KEY", "")),
             "api_key_set": bool(env.get("DEEPSEEK_API_KEY")),
@@ -291,10 +303,23 @@ async def api_save(request: Request) -> dict:
         base_url = values.get("DEEPSEEK_BASE_URL", "")
         if not base_url:
             return {"ok": False, "error": "Base URL 不能为空"}
-        # 该提供商档案独立保存；Key/模型留空时沿用档案里的旧值（评审 P2-13）
         profiles = _load_profiles()
         old_profile = profiles.get(provider, {})
-        new_key = values.get("DEEPSEEK_API_KEY") or old_profile.get("api_key", "")
+        requested_base = base_url.rstrip("/")
+        old_base = str(old_profile.get("base_url", "")).rstrip("/")
+        # 评审 v3 P0-1：换 Base URL 不带新 Key = 把旧 Key 发往新地址，拒绝；
+        # 只有 base 与档案一致时才允许沿用档案 Key（正常切换流程）
+        if requested_base != old_base and not values.get("DEEPSEEK_API_KEY"):
+            return {"ok": False, "error": "更换 Base URL 时必须同时填写 API Key"}
+        old_key = str(old_profile.get("api_key", ""))
+        if old_key and _looks_masked(old_key):
+            old_key = ""   # 评审 v3 P2-7：历史掩码 Key 不可复用
+        if not values.get("DEEPSEEK_API_KEY") and requested_base == old_base \
+                and not old_key and not base_url.startswith(("http://127.0.0.1",
+                                                             "http://localhost")):
+            return {"ok": False, "error": "该档案保存的是掩码 Key，请重新输入完整 Key"}
+        new_key = values.get("DEEPSEEK_API_KEY") or \
+            (old_key if requested_base == old_base else "")
         new_model = values.get("DEEPSEEK_MODEL") or old_profile.get("model", "")
         is_local = base_url.startswith(("http://127.0.0.1", "http://localhost"))
         if not new_key and not is_local:
@@ -306,6 +331,12 @@ async def api_save(request: Request) -> dict:
         values["DEEPSEEK_BASE_URL"] = base_url
         values["DEEPSEEK_API_KEY"] = new_key
         values["DEEPSEEK_MODEL"] = new_model
+    elif values.get("DEEPSEEK_BASE_URL"):
+        # 评审 v3 P0-1：非提供商路径同样不许"换地址留旧 Key"
+        new_base = values["DEEPSEEK_BASE_URL"].rstrip("/")
+        old_base = before.get("DEEPSEEK_BASE_URL", "").rstrip("/")
+        if new_base != old_base and not values.get("DEEPSEEK_API_KEY"):
+            return {"ok": False, "error": "更换 Base URL 时必须同时填写 API Key"}
     if admin_list:
         values["SUPERUSERS"] = json.dumps(admin_list, ensure_ascii=False)
     try:
@@ -365,6 +396,8 @@ async def api_test(request: Request) -> dict:
     if not key:
         return {"ok": False,
                 "error": "请先填 API Key（不会拿已保存的 Key 去请求其他地址）"}
+    if _looks_masked(key):   # 评审 v3 P2-8：掩码 Key 不可用于测试
+        return {"ok": False, "error": "该 Key 是掩码，请输入完整 Key 再测试"}
     model = (str(body.get("model") or "") or env.get("DEEPSEEK_MODEL", "")).strip()
     # 真实 API 调用可达数秒，放线程池执行，不能阻塞事件循环
     return await asyncio.to_thread(_llm_test, base, key, model)
@@ -419,8 +452,11 @@ async def api_plugin_toggle(request: Request) -> dict:
     # 第三方插件的启用/停用需要真重启内核才生效（评审 P1-4）；内置插件运行时生效
     if plugin_id in plugin_manager.thirdparty_pips() and enabled != (
             plugin_manager.module_of(plugin_id) in await asyncio.to_thread(_kernel_plugins)):
-        if not await _restart_kernel_if_running():
-            return {"ok": False, "error": "内核重启失败，插件状态可能未生效，请看运行日志"}
+        if _running("bot") or _pid_on_port(BOT_PORT):
+            if not await _restart_kernel_if_running():
+                return {"ok": False, "error": "内核重启失败，插件状态可能未生效，请看运行日志"}
+        else:
+            return {"ok": True, "note": "内核未运行，下次启动生效"}   # 评审 v3 P2-10
     return {"ok": True}
 
 
@@ -442,31 +478,49 @@ def _kernel_identity_ok(pid: int) -> bool:
         return False
 
 
+_restart_lock = asyncio.Lock()   # 评审 v3 P2-10：重启串行，防并发双启
+
+
+async def _restart_poll_delay() -> None:
+    await _restart_poll_delay()   # 测试可 patch 本函数跳过真实等待
+
+
 async def _restart_kernel_if_running() -> bool:
-    """真重启（评审 P1-4）：找旧内核→校验身份→停→等端口释放→拉起→轮询 healthz。"""
-    pid = await asyncio.to_thread(_pid_on_port, BOT_PORT)
-    if pid and not await asyncio.to_thread(_kernel_identity_ok, pid):
-        return False   # 端口被陌生进程占用：宁可不动作，也不误杀
-    if not (_running("bot") or pid is not None):
+    """真重启（评审 P1-4）：找旧内核→校验身份→停→等端口释放→拉起→轮询 healthz。
+
+    成功判定必须 PID 变化（评审 v3 P1-6）：kill 失败时旧内核仍占端口并返回
+    200，按旧逻辑会谎报"重启成功"。
+    """
+    async with _restart_lock:
+        old_pid = await asyncio.to_thread(_pid_on_port, BOT_PORT)
+        if old_pid and not await asyncio.to_thread(_kernel_identity_ok, old_pid):
+            return False   # 端口被陌生进程占用：宁可不动作，也不误杀
+        if not (_running("bot") or old_pid is not None):
+            return False
+        await asyncio.to_thread(_stop, "bot")
+        if old_pid:
+            killed = await asyncio.to_thread(_kill_pid, old_pid)
+            if not killed:
+                return False
+        for _ in range(20):   # 最多等 10 秒端口释放
+            if _pid_on_port(BOT_PORT) is None:
+                break
+            await _restart_poll_delay()
+        else:
+            return False   # 端口没释放：新内核起不来，不谎报
+        await asyncio.to_thread(_spawn, "bot", "app.main", BOT_OUT)
+        for _ in range(40):   # 最多等 20 秒起来
+            try:
+                resp = await asyncio.to_thread(
+                    httpx.get, f"http://127.0.0.1:{BOT_PORT}/healthz", timeout=1.5)
+                new_pid = resp.json().get("pid")
+                if resp.status_code == 200 and new_pid \
+                        and new_pid != old_pid:
+                    return True
+            except Exception:
+                pass
+            await _restart_poll_delay()
         return False
-    await asyncio.to_thread(_stop, "bot")
-    if pid:
-        await asyncio.to_thread(_kill_pid, pid)
-    for _ in range(20):   # 最多等 10 秒端口释放
-        if _pid_on_port(BOT_PORT) is None:
-            break
-        await asyncio.sleep(0.5)
-    await asyncio.to_thread(_spawn, "bot", "app.main", BOT_OUT)
-    for _ in range(40):   # 最多等 20 秒起来
-        try:
-            resp = await asyncio.to_thread(
-                httpx.get, f"http://127.0.0.1:{BOT_PORT}/healthz", timeout=1.5)
-            if resp.status_code == 200:
-                return True
-        except Exception:
-            pass
-        await asyncio.sleep(0.5)
-    return False
 
 
 def _kernel_plugins() -> list[str]:
@@ -589,25 +643,27 @@ def _pid_on_port(port: int) -> int | None:
     return None
 
 
-def _kill_pid(pid: int) -> None:
+def _kill_pid(pid: int) -> bool:
     if Path("C:/Windows").exists():  # Windows：/T 连子进程树一起收
-        subprocess.run(["taskkill", "/F", "/T", "/PID", str(pid)],
-                       capture_output=True)
-    else:
-        import os
-        import signal
-        try:
-            os.kill(pid, signal.SIGTERM)
-        except OSError:
-            pass
+        result = subprocess.run(["taskkill", "/F", "/T", "/PID", str(pid)],
+                                capture_output=True)
+        return result.returncode == 0   # 评审 v3 P1-6：成败要如实上报
+    import os
+    import signal
+    try:
+        os.kill(pid, signal.SIGTERM)
+        return True
+    except OSError:
+        return False
 
 
 @app.post("/api/bot/stop")
 async def api_bot_stop() -> dict:
     await asyncio.to_thread(_stop, "bot")
-    # 内核也可能是 start.bat 手动启动的：按端口补刀，保证按钮永远有效
+    # 内核也可能是 start.bat 手动启动的：按端口补刀，保证按钮永远有效；
+    # 但陌生进程（评审 v3 P2-19）绝不误杀
     pid = await asyncio.to_thread(_pid_on_port, BOT_PORT)
-    if pid:
+    if pid and await asyncio.to_thread(_kernel_identity_ok, pid):
         await asyncio.to_thread(_kill_pid, pid)
     return {"ok": True}
 
@@ -695,9 +751,14 @@ async def api_qrcode():
 
 
 def _tail(path: Path, lines: int = 60) -> str:
+    """只读文件尾部 64KB（评审 v3 P2-20：大日志不整读）。"""
     try:
-        content = path.read_text(encoding="utf-8", errors="replace").splitlines()
-        return "\n".join(content[-lines:])
+        with path.open("rb") as fh:
+            fh.seek(0, 2)
+            size = fh.tell()
+            fh.seek(max(0, size - 64 * 1024))
+            data = fh.read().decode("utf-8", errors="replace")
+        return "\n".join(data.splitlines()[-lines:])
     except OSError:
         return ""
 

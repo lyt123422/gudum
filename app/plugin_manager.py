@@ -35,7 +35,7 @@ BUILTIN: list[dict] = [
 # type=local 表示"本地内置插件，安装=装依赖+开启"，不是 pip 第三方
 MARKET: list[dict] = [
     {"pip": "local:douyin", "type": "local", "id": "douyin",
-     "deps": ["uiautomator2"],
+     "deps": ["uiautomator2==3.7.1"],
      "name": "抖音真机", "cat": "刷抖音",
      "desc": "QQ 遥控安卓手机真刷抖音：真滑动/真声音/真点赞，AI 看真实屏幕做决策。"
              "需手机开 USB 调试连电脑；限单次60分钟/每日120分钟，管理员专用"},

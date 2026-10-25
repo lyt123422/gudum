@@ -1,20 +1,24 @@
-"""修复回归测试（离线）：不碰真实 .env / QQ / 浏览器。
+"""修复回归测试（离线）：不碰真机、不碰真实 .env / data。
 
 运行：.venv\\Scripts\\python.exe -m unittest discover tests -v
 """
 from __future__ import annotations
 
 import asyncio
+import io
+import os
 import tempfile
 import unittest
 from pathlib import Path
 from unittest import mock
 
+os.environ["PANEL_NO_OPEN"] = "1"   # 评审 v3 P1-8：测试绝不弹浏览器
+
 ROOT = Path(__file__).resolve().parents[1]
 
 
 class TestMaskedKey(unittest.TestCase):
-    """评审 P0-1：掩码 Key 必须被识别并拒绝。"""
+    """评审 P0-1：掩码 Key 必须被识别并拒绝（全部在临时 .env 上验证）。"""
 
     def test_masked_variants_rejected(self):
         from app.panel import _looks_masked
@@ -30,21 +34,22 @@ class TestMaskedKey(unittest.TestCase):
             env = Path(tmp) / ".env"
             env.write_text('DEEPSEEK_API_KEY="sk-realkey123456"\n'
                            'DEEPSEEK_MODEL="deepseek-chat"\n', encoding="utf-8")
-            client = TestClient(panel.app, base_url="http://127.0.0.1:8090")
-            r = client.post("/api/save", json={"api_key": "sk-b23…23e8"})
+            with mock.patch.object(panel, "ENV_FILE", env):
+                client = TestClient(panel.app, base_url="http://127.0.0.1:8090")
+                r = client.post("/api/save", json={"api_key": "sk-b23…23e8"})
             self.assertFalse(r.json()["ok"])
             self.assertIn("掩码", r.json()["error"])
             self.assertIn("sk-realkey123456", env.read_text(encoding="utf-8"))
 
 
 class TestSaveChangedDetection(unittest.TestCase):
-    """评审 P1-1：before 快照在写入前，changed 才真实；重启结果如实返回。"""
+    """评审 P1-1：before 快照在写入前；v3 P0-1：换 base 必须带新 Key。"""
 
     def _client(self, tmp: Path):
         from fastapi.testclient import TestClient
         from app import panel
         env = Path(tmp) / ".env"
-        env.write_text('DEEPSEEK_API_KEY="sk-realkey123456"\n'
+        env.write_text('DEEPSEEK_API_KEY="sk-test-old"\n'
                        'DEEPSEEK_MODEL="deepseek-chat"\n'
                        'DEEPSEEK_BASE_URL="https://api.deepseek.com"\n'
                        'NAPCAT_ACCOUNT="123456789"\n'
@@ -55,18 +60,19 @@ class TestSaveChangedDetection(unittest.TestCase):
             started["n"] += 1
             return True
 
-        p = mock.patch.object(panel, "ENV_FILE", env)
-        p2 = mock.patch.object(panel, "_running", lambda name: True)
-        p3 = mock.patch.object(panel, "_pid_on_port", lambda port: 111)
-        p4 = mock.patch.object(panel, "_restart_kernel_if_running", fake_restart)
-        for x in (p, p2, p3, p4):
+        patches = [mock.patch.object(panel, "ENV_FILE", env),
+                   mock.patch.object(panel, "_running", lambda name: True),
+                   mock.patch.object(panel, "_pid_on_port", lambda port: 111),
+                   mock.patch.object(panel, "_restart_kernel_if_running",
+                                     fake_restart)]
+        for x in patches:
             x.start()
-        self.addCleanup(lambda: [x.stop() for x in (p, p2, p3, p4)])
-        return TestClient(panel.app, base_url="http://127.0.0.1:8090"), started
+        self.addCleanup(lambda: [x.stop() for x in patches])
+        return TestClient(panel.app, base_url="http://127.0.0.1:8090"), started, env
 
     def test_model_change_restarts(self):
         with tempfile.TemporaryDirectory() as tmp:
-            client, started = self._client(Path(tmp))
+            client, started, _ = self._client(Path(tmp))
             r = client.post("/api/save", json={"model": "deepseek-reasoner"}).json()
             self.assertTrue(r["ok"])
             self.assertTrue(r["bot_restarted"])
@@ -74,7 +80,7 @@ class TestSaveChangedDetection(unittest.TestCase):
 
     def test_account_only_no_restart(self):
         with tempfile.TemporaryDirectory() as tmp:
-            client, started = self._client(Path(tmp))
+            client, started, _ = self._client(Path(tmp))
             r = client.post("/api/save", json={"napcat_account": "987654321"}).json()
             self.assertTrue(r["ok"])
             self.assertFalse(r["bot_restarted"])
@@ -82,12 +88,38 @@ class TestSaveChangedDetection(unittest.TestCase):
 
     def test_superusers_change_restarts(self):
         with tempfile.TemporaryDirectory() as tmp:
-            client, started = self._client(Path(tmp))
+            client, started, _ = self._client(Path(tmp))
             r = client.post("/api/save", json={"superuser": "111111111,222222222"}).json()
             self.assertTrue(r["ok"])
             self.assertTrue(r["bot_restarted"])
-            env_text = (Path(tmp) / ".env").read_text(encoding="utf-8")
-            self.assertIn('["111111111", "222222222"]', env_text)
+            self.assertIn('["111111111", "222222222"]',
+                          (Path(tmp) / ".env").read_text(encoding="utf-8"))
+
+    def test_evil_base_without_key_rejected(self):
+        """评审 v3 P0-1：换 base_url 不带 Key = 旧 Key 外带，必须拒绝。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            client, started, env = self._client(Path(tmp))
+            r = client.post("/api/save", json={
+                "base_url": "http://127.0.0.1:9999/v1",
+                "model": "deepseek-chat"}).json()
+            self.assertFalse(r["ok"])
+            self.assertIn("API Key", r["error"])
+            text = env.read_text(encoding="utf-8")
+            self.assertIn("sk-test-old", text)
+            self.assertNotIn("9999", text)
+            self.assertEqual(started["n"], 0)
+
+    def test_evil_base_with_new_key_allowed(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            client, started, env = self._client(Path(tmp))
+            r = client.post("/api/save", json={
+                "base_url": "http://127.0.0.1:9999/v1",
+                "api_key": "sk-test-new",
+                "model": "deepseek-chat"}).json()
+            self.assertTrue(r["ok"])
+            text = env.read_text(encoding="utf-8")
+            self.assertIn("sk-test-new", text)
+            self.assertNotIn("sk-test-old", text)
 
 
 class TestEnvInjection(unittest.TestCase):
@@ -126,11 +158,14 @@ class TestVision(unittest.TestCase):
         png = b"\x89PNG\r\n\x1a\n" + b"x" * 300
 
         class FakeResp:
-            content = png
+            status_code = 200
             headers = {}
 
             def raise_for_status(self):
                 pass
+
+            async def aiter_bytes(self):
+                yield png
 
         class FakeClient:
             def __init__(self, **kw):
@@ -156,30 +191,185 @@ class TestVision(unittest.TestCase):
 
 
 class TestDouyinRealDevice(unittest.TestCase):
-    """抖音真机模块（网页版已移除，防回归：不得再出现网页抓取方案）。"""
+    """真机模块：全部用 FakeDevice，绝不触碰已连接的手机。"""
+
+    def setUp(self):
+        from app import douyin
+        if douyin._alive() or douyin._state["device"] is not None:
+            self.skipTest("真机在线/会话进行中，跳过以免干扰用户")
+        self._snapshot = dict(douyin._state)
+        self._old_sleep = douyin._pause_aware_sleep
+        douyin._pause_aware_sleep = lambda s: None
+
+    def tearDown(self):
+        from app import douyin
+        douyin._pause_aware_sleep = self._old_sleep
+        douyin._state.update(self._snapshot)
 
     def test_web_scraping_gone(self):
-        from pathlib import Path
-        src = (Path(__file__).resolve().parents[1] / "app" / "douyin.py").read_text(
-            encoding="utf-8")
+        src = (ROOT / "app" / "douyin.py").read_text(encoding="utf-8")
         self.assertNotIn("DrissionPage", src)
         self.assertNotIn("get_screenshot", src)   # 网页截屏痕迹
         self.assertIn("uiautomator2", src)        # 真机方案在位
 
-    def tearDown(self):
-        # 安全阀：任何用例都不得在真机上留下运行中的会话
-        from app import douyin
-        douyin.stop()
-
     def test_start_requires_connection(self):
         from app import douyin
-        # 测试绝不触碰真机：mock 掉连接，只验证失败路径的报错文案
         douyin._state["device"] = None
         with mock.patch.object(douyin, "connect",
                                lambda: (False, "测试环境：不连手机")):
             ok, msg = douyin.start(1)
         self.assertFalse(ok)
         self.assertIn("测试环境", msg)
+
+    def test_execute_decision_swipes_once(self):
+        from app import douyin
+        dev = FakeDevice()
+        cw = douyin._execute_decision(dev, {"action": "next", "watch": 5}, 0)
+        self.assertEqual(dev.swipes, 1)
+        self.assertEqual(cw, 0)
+        cw = douyin._execute_decision(dev, {"action": "like", "watch": 5}, 0)
+        self.assertEqual(dev.taps, 1)
+        self.assertEqual(dev.swipes, 2)   # like 一次 + 此前 next 一次
+        self.assertEqual(cw, 0)
+        cw = douyin._execute_decision(dev, {"action": "follow", "watch": 5}, 0)
+        self.assertEqual(dev.follow_clicked, 1)
+        self.assertEqual(dev.swipes, 3)
+        self.assertEqual(cw, 0)
+
+    def test_execute_decision_watch_then_swipe(self):
+        from app import douyin
+        dev = FakeDevice()
+        cw = douyin._execute_decision(dev, {"action": "watch", "watch": 5}, 0)
+        self.assertEqual(dev.swipes, 0)   # 还在看这条
+        self.assertEqual(cw, 1)
+        cw = douyin._execute_decision(dev, {"action": "watch", "watch": 5}, cw)
+        self.assertEqual(dev.swipes, 1)   # 连续看两轮后划走
+        self.assertEqual(cw, 0)
+
+    def test_follow_never_unfollows(self):
+        from app import douyin
+        dev = FakeDevice(follow_state="已关注")
+        self.assertFalse(douyin._follow(dev))
+        self.assertEqual(dev.follow_clicked, 0)
+        dev2 = FakeDevice(follow_state="关注")
+        self.assertTrue(douyin._follow(dev2))
+        self.assertEqual(dev2.follow_clicked, 1)
+
+    def test_frame_variants(self):
+        from app import douyin
+        from PIL import Image
+
+        class Dev:
+            def __init__(self, img):
+                self.img = img
+
+            def screenshot(self):
+                return self.img
+
+        big_rgb = Image.new("RGB", (2000, 1000), "red")
+        buf = io.BytesIO()
+        big_rgb.save(buf, format="PNG")
+        for variant in (big_rgb,
+                        Image.new("RGBA", (500, 500), "blue"),
+                        Image.new("P", (300, 300)).convert("P"),
+                        buf.getvalue()):   # bytes = PNG 编码（u2 bytes 形态）
+            data = douyin._frame(Dev(variant))
+            out = Image.open(io.BytesIO(data))
+            self.assertLessEqual(max(out.size), 1280)
+
+    def test_ai_decide_parses_and_closes(self):
+        from app import douyin
+
+        class FakeClient:
+            def __init__(self, reply):
+                self.reply = reply
+                self.closed = 0
+
+            async def chat(self, messages):
+                return self.reply
+
+            async def aclose(self):
+                self.closed += 1
+
+        shots = (b"\x89PNG\r\n\x1a\n" + b"a" * 200,) * 2
+        good = FakeClient('前面有些废话 {"action":"like","watch_seconds":"x",'
+                          '"reason":"好看"} 后面也有')
+        with mock.patch.object(douyin, "_ai_client", lambda: good):
+            d = douyin._ai_decide(*shots)
+        self.assertEqual(d["action"], "like")
+        self.assertEqual(d["watch"], 5)
+        self.assertEqual(good.closed, 1)
+        bad = FakeClient("我不会 JSON")
+        with mock.patch.object(douyin, "_ai_client", lambda: bad):
+            with self.assertRaises(RuntimeError):
+                douyin._ai_decide(*shots)
+        self.assertEqual(bad.closed, 1)
+
+
+class FakeSelector:
+    def __init__(self, present):
+        self.present = present
+        self.clicked = 0
+
+    def exists(self, timeout=0):
+        return self.present
+
+    def click(self):
+        self.clicked += 1
+
+
+class FakeDevice:
+    """uiautomator2 设备的离线替身：只计数，不连 adb。"""
+
+    def __init__(self, follow_state: str = "关注"):
+        self.follow_state = follow_state
+        self.follow_clicked = 0
+        self.swipes = 0
+        self.taps = 0
+
+    def window_size(self):
+        return (1080, 2400)
+
+    def swipe(self, *a, **kw):
+        self.swipes += 1
+
+    def double_click(self, *a, **kw):
+        self.taps += 1
+
+    def click(self, *a, **kw):
+        pass
+
+    def __call__(self, **kw):
+        pat = str(kw.get("textMatches", ""))
+        if "已关注" in pat or "互相关注" in pat:
+            return FakeSelector(self.follow_state != "关注")
+        if pat == r"^关注$":
+            sel = FakeSelector(self.follow_state == "关注")
+
+            def _click():
+                sel.clicked += 1
+                self.follow_clicked += 1
+            sel.click = _click
+            return sel
+        return FakeSelector(False)
+
+
+class TestDailyLedger(unittest.TestCase):
+    """评审 P2-4：账本遇到损坏/异形 JSON 不炸。"""
+
+    def test_shapes(self):
+        from app import douyin
+        with tempfile.TemporaryDirectory() as tmp:
+            f = Path(tmp) / "daily.json"
+            with mock.patch.object(douyin, "DAILY_FILE", f):
+                f.write_text("[]", encoding="utf-8")
+                self.assertEqual(douyin._daily_minutes(), 0)
+                f.write_text("{broken", encoding="utf-8")
+                self.assertEqual(douyin._daily_minutes(), 0)
+                douyin._add_daily(7)
+                self.assertEqual(douyin._daily_minutes(), 7)
+                douyin._add_daily(3)
+                self.assertEqual(douyin._daily_minutes(), 10)
 
 
 class TestRedactLog(unittest.TestCase):
@@ -197,31 +387,110 @@ class TestRedactLog(unittest.TestCase):
 
 
 class TestPanelSecurityRegression(unittest.TestCase):
-    """CSRF/Host 防护回归（上一轮 P0-1 不得回退）。"""
+    """CSRF/Host 防护 + v3 P2-8/9 回归（全部 patch 掉真实文件）。"""
+
+    def _client(self, tmp: Path):
+        from fastapi.testclient import TestClient
+        from app import panel, plugin_manager
+        env = Path(tmp) / ".env"
+        env.write_text('DEEPSEEK_API_KEY="sk-realkey123456"\n'
+                       'DEEPSEEK_MODEL="deepseek-chat"\n'
+                       'SUPERUSERS=["10000"]\n', encoding="utf-8")
+        state = Path(tmp) / "plugins.json"
+        state.write_text("{}", encoding="utf-8")
+        patches = [mock.patch.object(panel, "ENV_FILE", env),
+                   mock.patch.object(plugin_manager, "STATE_FILE", state)]
+        for x in patches:
+            x.start()
+        self.addCleanup(lambda: [x.stop() for x in patches])
+        return TestClient(panel.app, base_url="http://127.0.0.1:8090")
 
     def test_csrf_layers(self):
-        from fastapi.testclient import TestClient
-        from app import panel
-        client = TestClient(panel.app, base_url="http://127.0.0.1:8090")
-        r = client.post("/api/plugin/toggle", content='{}',
-                        headers={"Content-Type": "text/plain"})
-        self.assertEqual(r.status_code, 415)
-        r = client.post("/api/plugin/toggle", json={"id": "memes", "enabled": True},
-                        headers={"Origin": "http://evil.example"})
-        self.assertEqual(r.status_code, 403)
-        r = client.post("/api/plugin/toggle", json={"id": "memes", "enabled": True})
-        self.assertEqual(r.status_code, 200)
-        self.assertTrue(r.json()["ok"])
-        r = client.get("/api/status", headers={"Host": "evil.com:8090"})
-        self.assertEqual(r.status_code, 403)
+        with tempfile.TemporaryDirectory() as tmp:
+            client = self._client(Path(tmp))
+            r = client.post("/api/plugin/toggle", content='{}',
+                            headers={"Content-Type": "text/plain"})
+            self.assertEqual(r.status_code, 415)
+            r = client.post("/api/plugin/toggle", json={"id": "memes", "enabled": True},
+                            headers={"Origin": "http://evil.example"})
+            self.assertEqual(r.status_code, 403)
+            r = client.post("/api/plugin/toggle", json={"id": "memes", "enabled": True})
+            self.assertEqual(r.status_code, 200)
+            self.assertTrue(r.json()["ok"])
+            r = client.get("/api/status", headers={"Host": "evil.com:8090"})
+            self.assertEqual(r.status_code, 403)
 
     def test_config_masks_key(self):
-        from fastapi.testclient import TestClient
+        with tempfile.TemporaryDirectory() as tmp:
+            client = self._client(Path(tmp))
+            key = client.get("/api/config").json().get("api_key", "")
+            self.assertTrue(key == "" or "…" in key)
+
+    def test_config_bad_superusers(self):
+        """评审 v3 P2-9：SUPERUSERS=123 之类坏值不再 500。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            from fastapi.testclient import TestClient
+            from app import panel
+            env = Path(tmp) / ".env"
+            env.write_text('SUPERUSERS=123\n', encoding="utf-8")
+            with mock.patch.object(panel, "ENV_FILE", env):
+                client = TestClient(panel.app, base_url="http://127.0.0.1:8090")
+                r = client.get("/api/config")
+            self.assertEqual(r.status_code, 200)
+            self.assertEqual(r.json().get("superusers"), [])
+
+    def test_llm_test_never_leaks_key(self):
+        """评审 v3 P2-8：provider 异常回显 Key 时，响应必须脱敏。"""
         from app import panel
-        client = TestClient(panel.app, base_url="http://127.0.0.1:8090")
-        body = client.get("/api/config").json()
-        key = body.get("api_key", "")
-        self.assertTrue(key == "" or "…" in key)
+        with mock.patch("openai.OpenAI",
+                        side_effect=RuntimeError("boom Authorization: Bearer sk-secret123")):
+            out = panel._llm_test("https://api.deepseek.com", "sk-x", "m")
+        self.assertFalse(out["ok"])
+        self.assertNotIn("sk-secret123", out["error"])
+
+
+class TestRestartPidGuard(unittest.TestCase):
+    """评审 v3 P1-6：重启成功必须 PID 变化，kill 失败不谎报。"""
+
+    def _run(self, health_pid):
+        from app import panel
+
+        class Resp:
+            status_code = 200
+
+            def json(self):
+                return {"pid": health_pid}
+
+        calls = {"n": 0}
+
+        def fake_pid_on_port(port):
+            # 首次（找旧内核）= 旧 PID；重启后端口探测 = 已释放
+            calls["n"] += 1
+            return 111 if calls["n"] == 1 else None
+
+        async def fake_sleep(_=0):
+            return   # 占位（真正跳过用 _restart_poll_delay patch）
+
+        patches = [mock.patch.object(panel, "_pid_on_port", fake_pid_on_port),
+                   mock.patch.object(panel, "_kernel_identity_ok", lambda pid: True),
+                   mock.patch.object(panel, "_running", lambda n: True),
+                   mock.patch.object(panel, "_stop", lambda n: None),
+                   mock.patch.object(panel, "_kill_pid", lambda pid: True),
+                   mock.patch.object(panel, "_spawn", lambda *a, **k: None),
+                   mock.patch.object(panel.httpx, "get",
+                                     lambda *a, **k: Resp()),
+                   mock.patch.object(panel, "_restart_poll_delay",
+                                     lambda: asyncio.sleep(0))]
+        for x in patches:
+            x.start()
+        self.addCleanup(lambda: [x.stop() for x in patches])
+        return asyncio.run(panel._restart_kernel_if_running())
+
+    def test_same_pid_means_failed_restart(self):
+        self.assertFalse(self._run(health_pid=111))
+
+    def test_new_pid_means_success(self):
+        self.assertTrue(self._run(health_pid=222))
 
 
 if __name__ == "__main__":

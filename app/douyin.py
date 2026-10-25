@@ -15,7 +15,6 @@ import base64
 import io
 import json
 import random
-import re
 import shutil
 import subprocess
 import threading
@@ -35,10 +34,11 @@ MAX_SESSION_MIN = 60
 MAX_DAILY_MIN = 120
 
 _state: dict = {"device": None, "dev_lock": threading.Lock(),
+                "connect_lock": threading.Lock(),
                 "thread": None, "stop": threading.Event(),
                 "pause": threading.Event(), "started_at": 0.0,
                 "plan_min": 0, "last_active": 0.0,
-                "ai_failures": 0, "last_error": "", "watchdog": None}
+                "ai_failures": 0, "gen": 0, "last_error": "", "watchdog": None}
 
 
 # ---------- adb / 设备 ----------
@@ -137,29 +137,33 @@ def device_status() -> dict:
 
 def connect() -> tuple[bool, str]:
     """诊断+连接：adb → 授权 → u2 代理 → 抖音安装检查，缺啥说啥。"""
-    st = device_status()
-    if not st["adb"]:
-        ok, result = download_adb()
-        if not ok:
-            return False, result
+    if _alive():   # 评审 v3 P1-3：会话进行中禁止重连（防新旧双 Device 同操手机）
+        return False, "正在刷视频，先发「停止抖音」再重连手机"
+    with _state["connect_lock"]:
         st = device_status()
-    if not st["device"]:
-        return False, ("没看到手机：检查 USB 线、手机上「USB 调试」已开、"
-                       "并点击手机弹出的「允许 USB 调试」授权")
-    if "未授权" in st["device"]:
-        return False, "手机弹了授权框：点「允许 USB 调试」（可勾选一律允许）"
-    if not st["douyin"]:
-        return False, "手机上没装抖音 App，先装好再连"
-    if not st.get("agent"):
-        err = st.get("agent_error", "")
-        return False, f"自动化代理没就绪（{err or '首次连接需在手机上确认安装提示'}），重试一次"
-    try:
-        import uiautomator2 as u2   # noqa: PLC0415
-        with _state["dev_lock"]:
-            _state["device"] = u2.connect(st["device"])
-    except Exception as exc:   # noqa: BLE001
-        return False, f"连接失败：{str(exc)[:120]}"
-    return True, f"✅ 手机已连接（{st['device']}），抖音{'已装' if st['douyin'] else ''}，可以发「刷抖音」了"
+        if not st["adb"]:
+            ok, result = download_adb()
+            if not ok:
+                return False, result
+            st = device_status()
+        if not st["device"]:
+            return False, ("没看到手机：检查 USB 线、手机上「USB 调试」已开、"
+                           "并点击手机弹出的「允许 USB 调试」授权")
+        if "未授权" in st["device"]:
+            return False, "手机弹了授权框：点「允许 USB 调试」（可勾选一律允许）"
+        if not st["douyin"]:
+            return False, "手机上没装抖音 App，先装好再连"
+        if not st.get("agent"):
+            err = st.get("agent_error", "")
+            return False, (f"自动化代理没就绪（{err or '首次连接需在手机上确认安装提示'}），"
+                           "手机上点允许后重试一次")
+        try:
+            import uiautomator2 as u2   # noqa: PLC0415
+            with _state["dev_lock"]:
+                _state["device"] = u2.connect(st["device"])
+        except Exception as exc:   # noqa: BLE001
+            return False, f"连接失败：{str(exc)[:120]}"
+    return True, f"✅ 手机已连接（{st['device']}），抖音已装，可以发「刷抖音」了"
 
 
 def _d():
@@ -213,7 +217,12 @@ def _alive() -> bool:
 
 def status() -> dict:
     with _state["dev_lock"]:
-        connected = _state["device"] is not None
+        dev = _state["device"]
+        connected = dev is not None and _device_alive(dev)
+        if dev is not None and not connected:
+            # 死引用清掉（评审 v3 P1-7）：拔线后不再假报"已连接"
+            _state["device"] = None
+            _state["last_error"] = _state["last_error"] or "手机已断开，发「连接手机」重连"
     return {"running": _alive(), "paused": _state["pause"].is_set(),
             "connected": connected,
             "elapsed_min": round((time.time() - _state["started_at"]) / 60, 1)
@@ -228,23 +237,38 @@ def _ai_client():
     from .deepseek_api import DeepSeekClient
     from .envutil import ENV_FILE, load_env
     env = load_env(ENV_FILE)
+    # 真机决策专用：短超时+零重试（评审 v3 P1-5：否则一次决策最长 135s，
+    # stop 的 8 秒 join 必然超时变成僵尸会话）
     return DeepSeekClient(
         base_url=env.get("DEEPSEEK_BASE_URL") or "https://api.deepseek.com",
         api_key=env.get("DEEPSEEK_API_KEY") or "",
         model=env.get("DEEPSEEK_MODEL") or "deepseek-chat",
-        timeout=45)
+        timeout=30, max_retries=0, temperature=0.2)
+
+
+def _to_rgb_pil(img):
+    """u2 截图可能是 PIL(含 RGBA/P)/bytes/numpy——统一转 RGB PIL（评审 v3 P2-2）。"""
+    from PIL import Image
+    if isinstance(img, (bytes, bytearray)):
+        img = Image.open(io.BytesIO(bytes(img)))
+    if not isinstance(img, Image.Image):
+        import numpy as np   # noqa: PLC0415
+        img = Image.fromarray(np.asarray(img))
+    if img.mode != "RGB":
+        img = img.convert("RGB")
+    return img
 
 
 def _frame(dev) -> bytes:
-    """手机当前屏幕 → JPEG 字节（真画面：有声音有播放，我们只取视觉帧）。"""
-    img = dev.screenshot()
+    """手机当前屏幕 → JPEG 字节（真画面：有声音有播放，我们只取视觉帧）。
+
+    缩到最长边 1280：两帧全分辨率直进视觉模型既慢又贵（评审 v3 P2-2）。
+    """
+    img = _to_rgb_pil(dev.screenshot())
+    if max(img.size) > 1280:
+        img.thumbnail((1280, 1280))
     buf = io.BytesIO()
-    try:
-        img.save(buf, format="JPEG", quality=82)          # PIL.Image
-    except Exception:                                      # noqa: BLE001
-        import numpy as np                                 # noqa: PLC0415
-        from PIL import Image                              # noqa: PLC0415
-        Image.fromarray(np.asarray(img)).save(buf, format="JPEG", quality=82)
+    img.save(buf, format="JPEG", quality=82)
     return buf.getvalue()
 
 
@@ -270,21 +294,41 @@ def _ai_decide(shot1: bytes, shot2: bytes) -> dict:
 
     async def _call() -> str:
         client = _ai_client()
-        return await client.chat(messages)
+        try:
+            return await client.chat(messages)
+        finally:
+            await client.aclose()   # 评审 v3 P1-5：一次性客户端用完即关
 
     try:
-        text = asyncio.run(_call())
+        text = asyncio.run(asyncio.wait_for(_call(), timeout=25))
     except DeepSeekError as exc:
         raise RuntimeError(exc.message) from exc
-    m = re.search(r"\{.*\}", text, re.S)
-    if not m:
+    start_idx = text.find("{")
+    if start_idx < 0:
         raise RuntimeError(f"AI 没有返回 JSON：{text[:60]}")
-    data = json.loads(m.group(0))
+    depth, end_idx = 0, -1
+    for i in range(start_idx, len(text)):   # 取第一个平衡花括号块（评审 v3 P2-3）
+        if text[i] == "{":
+            depth += 1
+        elif text[i] == "}":
+            depth -= 1
+            if depth == 0:
+                end_idx = i
+                break
+    if end_idx < 0:
+        raise RuntimeError(f"AI 返回的 JSON 不完整：{text[:60]}")
+    try:
+        data = json.loads(text[start_idx:end_idx + 1])
+    except ValueError as exc:
+        raise RuntimeError(f"AI 返回的不是合法 JSON：{text[:60]}") from exc
     action = data.get("action", "next")
     if action not in ("next", "like", "watch", "follow"):
         action = "next"
-    return {"action": action,
-            "watch": max(3, min(30, int(data.get("watch_seconds") or 5))),
+    try:
+        watch = int(data.get("watch_seconds") or 5)
+    except (TypeError, ValueError):
+        watch = 5
+    return {"action": action, "watch": max(3, min(30, watch)),
             "reason": str(data.get("reason", ""))[:40]}
 
 
@@ -319,8 +363,11 @@ def _double_tap_like(dev) -> bool:
     w, h = dev.window_size()
     x, y = int(w * random.uniform(0.45, 0.55)), int(h * random.uniform(0.40, 0.48))
     try:
+        if hasattr(dev, "double_click"):   # 评审 v3 P3：规范双击，间隔随机
+            dev.double_click(x, y, duration=random.uniform(0.08, 0.12))
+            return True
         dev.click(x, y)
-        time.sleep(0.08)
+        time.sleep(random.uniform(0.08, 0.12))
         dev.click(x, y)
         return True
     except Exception:
@@ -328,22 +375,23 @@ def _double_tap_like(dev) -> bool:
 
 
 def _follow(dev) -> bool:
-    """点作者名旁的「关注」按钮（找不到就放弃，不强点）。"""
-    for kw in ("关注",):
-        try:
-            ele = dev(textContains=kw)
-            if ele.exists(timeout=1):
-                ele.click()
-                return True
-        except Exception:
-            continue
+    """点「关注」按钮；已关注/互相关注绝不点（评审 v3 P1-4：防误取关）。"""
+    try:
+        if dev(textMatches=r"^(已关注|互相关注)$").exists(timeout=0.5):
+            return False
+        ele = dev(textMatches=r"^关注$")
+        if ele.exists(timeout=1):
+            ele.click()
+            return True
+    except Exception:
+        pass
     return False
 
 
 def _open_douyin(dev) -> None:
     if not _in_douyin(dev):
         dev.app_start(DOUYIN_PACKAGE)
-        time.sleep(random.uniform(3, 5))
+        _pause_aware_sleep(random.uniform(3, 5))   # 评审 v3 P2-14：睡眠可被 stop 打断
 
 
 def _pause_aware_sleep(seconds: float) -> None:
@@ -356,31 +404,90 @@ def _pause_aware_sleep(seconds: float) -> None:
         time.sleep(min(1.0, max(0.05, end - time.time())))
 
 
-def _ai_session_loop(minutes: int) -> None:
-    """真机 AI 刷主循环：开抖音 → 两帧截图 → AI 决策 → 真滑动/真点赞。"""
+def _device_alive(dev) -> bool:
+    """设备对象是否还活着（拔线/手机重启后 info 会失败）。评审 v3 P1-7。"""
+    try:
+        return bool(dev) and bool(dev.info.get("displayWidth"))
+    except Exception:
+        return False
+
+
+def _ensure_foreground(dev) -> bool:
+    """亮屏+解锁+确认在抖音前台；亮屏但停在锁屏的情况也会处理。"""
+    for _ in range(2):
+        try:
+            dev.screen_on()
+            dev.unlock()
+            if _in_douyin(dev):
+                return True
+        except Exception:
+            return False
+        time.sleep(1)
+    return False
+
+
+def _execute_decision(dev, d: dict, consecutive_watch: int) -> int:
+    """执行一条 AI 决策，返回新的连续观看计数（评审 v3 P1-1：永远只滑一次）。"""
+    if d["action"] == "watch":
+        consecutive_watch += 1
+        if consecutive_watch >= 2:
+            _swipe_next(dev)
+            consecutive_watch = 0
+        else:
+            _pause_aware_sleep(d["watch"])
+        return consecutive_watch
+    if d["action"] == "like":
+        _double_tap_like(dev)
+        _pause_aware_sleep(random.uniform(1.5, 3))
+    elif d["action"] == "follow":
+        _follow(dev)
+        _pause_aware_sleep(random.uniform(2, 4))
+    _swipe_next(dev)
+    return 0
+
+
+def _ai_session_loop(minutes: int, gen: int) -> None:
+    """真机 AI 刷主循环：开抖音 → 两帧截图 → AI 决策 → 真滑动/真点赞。
+
+    gen（代数）：stop/新会话都会递增；循环内发现代数变化立即退出，
+    杜绝"stop 后旧线程还在操作手机"的僵尸会话（评审 v3 P1-3）。
+    """
     stop = _state["stop"]
-    deadline = time.time() + minutes * 60
+    session_start = time.time()   # 评审 v3 P2-16：快照，finally 用它算时长
+    deadline = session_start + minutes * 60
     consecutive_watch = 0
     try:
-        while not stop.is_set() and time.time() < deadline:
+        while not stop.is_set() and time.time() < deadline \
+                and gen == _state["gen"]:
             with _state["dev_lock"]:
                 dev = _state["device"]
-            if dev is None:
+            if dev is None or not _device_alive(dev):
+                _state["last_error"] = "手机已断开，发「连接手机」重连"
+                logger.warning("{}", _state["last_error"])
+                with _state["dev_lock"]:
+                    _state["device"] = None
                 break
             try:
-                _open_douyin(dev)
-                if dev.info.get("screenOn") is False:
-                    dev.screen_on()
-                    dev.unlock()
+                if not _ensure_foreground(dev):
+                    _state["last_error"] = "手机锁屏/未解锁，请解锁后重试"
+                    logger.warning("{}", _state["last_error"])
+                    break
+                if not _in_douyin(dev):
+                    _open_douyin(dev)
                 shot1 = _frame(dev)
             except Exception as exc:   # noqa: BLE001
                 _state["last_error"] = f"手机不可用: {str(exc)[:150]}"
                 logger.warning("{}", _state["last_error"])
+                with _state["dev_lock"]:
+                    if _state["device"] is not None \
+                            and not _device_alive(_state["device"]):
+                        _state["device"] = None
                 break
             _touch()
-            _pause_aware_sleep(random.uniform(4, 6))   # 看一会儿再取第二帧
-            if stop.is_set():
-                break
+            _pause_aware_sleep(min(random.uniform(4, 6),
+                                   max(0.1, deadline - time.time())))
+            if stop.is_set() or gen != _state["gen"]:
+                return
             try:
                 shot2 = _frame(dev)
             except Exception as exc:   # noqa: BLE001
@@ -401,42 +508,28 @@ def _ai_session_loop(minutes: int) -> None:
                     break
                 _pause_aware_sleep(random.uniform(3, 6))
                 continue
+            # 决策花了最长 25 秒：期间 stop/新会话可能已发生，动作必须作废
+            if stop.is_set() or gen != _state["gen"]:
+                return
             logger.info("🤖 AI 刷抖音(真机): {} ({})", d["action"], d["reason"])
             _record_decision(d)
             try:
-                if d["action"] == "like":
-                    _double_tap_like(dev)
-                    _pause_aware_sleep(random.uniform(1.5, 3))
-                elif d["action"] == "follow":
-                    _follow(dev)
-                    _pause_aware_sleep(random.uniform(2, 4))
-                elif d["action"] == "watch":
-                    consecutive_watch += 1
-                    if consecutive_watch >= 2:
-                        _swipe_next(dev)
-                        consecutive_watch = 0
-                    else:
-                        _pause_aware_sleep(d["watch"])
-                        continue   # 还在看这条
-                else:
-                    _swipe_next(dev)
-                if d["action"] != "watch":
-                    _swipe_next(dev)   # 看完/互动完划走
-                    consecutive_watch = 0
+                consecutive_watch = _execute_decision(dev, d, consecutive_watch)
             except Exception as exc:   # noqa: BLE001
                 _state["last_error"] = f"触控失败: {str(exc)[:150]}"
                 break
-            # 连续刷 6~12 分钟歇 1~3 分钟（真人在手机上也会歇）
-            if time.time() - _state.get("last_rest", _state["started_at"]) \
+            # 连续刷 6~12 分钟歇 1~3 分钟（真人在手机上也会歇），不超会话期
+            if time.time() - _state.get("last_rest", session_start) \
                     > random.uniform(360, 720):
                 _state["last_rest"] = time.time()
-                rest = random.uniform(60, 180)
+                rest = min(random.uniform(60, 180),
+                           max(0.0, deadline - time.time()))
                 logger.info("抖音真机散步：休息 {:.0f}s", rest)
                 _pause_aware_sleep(rest)
     except Exception as exc:   # noqa: BLE001
         _state["last_error"] = str(exc)[:200]
     finally:
-        _add_daily(int((time.time() - _state["started_at"]) / 60) or 1)
+        _add_daily(int((time.time() - session_start) / 60) or 1)
 
 
 def _start_watchdog() -> None:
@@ -467,18 +560,28 @@ def start(minutes: int) -> tuple[bool, str]:
     if _daily_minutes() + minutes > MAX_DAILY_MIN:
         left = max(0, MAX_DAILY_MIN - _daily_minutes())
         return False, f"今日上限 {MAX_DAILY_MIN} 分钟，还剩 {left} 分钟"
+    # 评审 v3 P1-5：启动前做真配置检查（原来的 _ai_client() 空建客户端是假验证）
+    from .envutil import ENV_FILE, load_env
+    env = load_env(ENV_FILE)
+    if not (env.get("DEEPSEEK_API_KEY") or "").strip():
+        return False, "还没填 API Key：控制台 → 模型配置"
+    if not (env.get("DEEPSEEK_MODEL") or "").strip():
+        return False, "还没设置模型：控制台 → 模型配置"
     ok, msg = connect()
     if not ok:
         return False, msg
-    _ai_client()   # 先验证模型配置可用
     _state["stop"].clear()
     _state["pause"].clear()
     _state["started_at"] = time.time()
     _state["plan_min"] = minutes
     _state["last_error"] = ""
     _state["ai_failures"] = 0
+    _state["gen"] = _state["gen"] + 1   # 新会话作废一切旧循环（评审 v3 P1-3）
+    _recent.clear()                     # 评审 v3 P2-15：决策记录不跨会话
+    _state["last_rest"] = time.time()   # 评审 v3 P3：休息计时随会话重置
     _state["thread"] = threading.Thread(target=_ai_session_loop,
-                                        args=(minutes,), daemon=True)
+                                        args=(minutes, _state["gen"]),
+                                        daemon=True)
     _state["thread"].start()
     _start_watchdog()
     _touch()
@@ -488,9 +591,13 @@ def start(minutes: int) -> tuple[bool, str]:
 
 def stop() -> tuple[bool, str]:
     _state["stop"].set()
+    _state["gen"] = _state["gen"] + 1   # 评审 v3 P1-3：代数作废，决策中的旧循环不再执行动作
     thread = _state["thread"]
     if thread and thread.is_alive():
         thread.join(timeout=8)
+    if thread is not None and thread.is_alive():
+        # 线程还卡在 AI 调用/触控里：不能谎报已停，也不能立刻允许新会话
+        return False, "停止中：当前动作还没结束，稍等几秒再发「停止抖音」"
     _state["thread"] = None
     _state["plan_min"] = 0
     return True, "已停止（手机上的抖音保持打开，可自己接着看）"
