@@ -15,7 +15,6 @@ WorkBuddy2API-Hub（F:\\WorkBuddy-Hub，MIT）把腾讯 workbuddy.ai / codebuddy
 from __future__ import annotations
 
 import json
-import os
 import subprocess
 import threading
 import time

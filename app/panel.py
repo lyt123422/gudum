@@ -21,7 +21,7 @@ import uvicorn
 from fastapi import FastAPI, Request
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
 
-from . import jailbreak, personas, plugin_manager, schedule_core
+from . import jailbreak, personas, plugin_manager, proxy_manager, schedule_core
 from .envutil import EnvValueError, load_env, update_env as _env_update
 from .log_setup import redact_log
 
@@ -39,6 +39,8 @@ NAPCAT_OUT = ROOT / "data" / "panel_napcat.log"
 _procs: dict[str, subprocess.Popen | None] = {"bot": None, "napcat": None}
 
 # 模型提供商预设与分档档案（设计参考 AstrBot「模型提供商」页：各家独立配置）
+PROXY_PROVIDER = "WorkBuddy反代"   # 反代激活时的模型源档案名（评审 v4 反代方案）
+
 PROVIDER_PRESETS: dict[str, dict | None] = {
     "DeepSeek": {"base_url": "https://api.deepseek.com", "model": "deepseek-chat"},
     "智谱GLM": {"base_url": "https://open.bigmodel.cn/api/paas/v4", "model": "glm-4-flash"},
@@ -91,6 +93,10 @@ def _ensure_profiles(env: dict[str, str]) -> dict[str, dict]:
 
 
 def _live_provider_name(base_url: str) -> str:
+    # 评审 v4 反代：反代激活时模型源显示为反代名
+    if proxy_manager.config().get("active") and \
+            base_url.rstrip("/") == proxy_manager.base_url().rstrip("/"):
+        return PROXY_PROVIDER
     home = next((name for name, preset in PROVIDER_PRESETS.items()
                  if preset and preset["base_url"] == base_url), None)
     return home or "自定义"
@@ -277,8 +283,11 @@ async def _body_json(request: Request) -> dict:
 async def api_save(request: Request) -> dict:
     body = await _body_json(request)
     before = load_env(ENV_FILE)   # 评审 P1-1：在任何写入之前快照，changed 才可信
+    proxy_on = bool(proxy_manager.config().get("active"))   # 评审 v4 反代：互斥
+    proxy_note = ""
     provider = str(body.get("provider") or "").strip()
-    if provider and provider not in PROVIDER_PRESETS:
+    if provider and provider not in PROVIDER_PRESETS \
+            and provider != PROXY_PROVIDER:
         return {"ok": False, "error": f"未知的提供商: {provider}"}
     # 只更新请求里显式携带的非空字段：掩码/空值=不修改，残缺请求不清配置
     field_map = {"base_url": "DEEPSEEK_BASE_URL", "api_key": "DEEPSEEK_API_KEY",
@@ -347,6 +356,28 @@ async def api_save(request: Request) -> dict:
             return {"ok": False, "error": "更换 Base URL 时必须同时填写 API Key"}
     if admin_list:
         values["SUPERUSERS"] = json.dumps(admin_list, ensure_ascii=False)
+    if proxy_on and any(k in values for k in
+                        ("DEEPSEEK_BASE_URL", "DEEPSEEK_API_KEY",
+                         "DEEPSEEK_MODEL")):
+        # 评审 v4 反代互斥：直连模型改动只存档案，模型源保持反代
+        if provider and provider != PROXY_PROVIDER:
+            profiles = _load_profiles()
+            old_profile = profiles.get(provider, {})
+            profiles[provider] = {
+                "base_url": values.get("DEEPSEEK_BASE_URL")
+                or old_profile.get("base_url", ""),
+                "api_key": values.get("DEEPSEEK_API_KEY")
+                or old_profile.get("api_key", ""),
+                "model": values.get("DEEPSEEK_MODEL")
+                or old_profile.get("model", "")}
+            _save_profiles(profiles)
+            proxy_note = "🔀 反代运行中：直连配置已存入档案（未激活），停止反代后生效"
+        elif not provider:
+            proxy_note = ("🔀 反代运行中：直连模型改动已忽略"
+                          "（选提供商胶囊可存为档案，或停止反代）")
+        values = {k: v for k, v in values.items()
+                  if k not in ("DEEPSEEK_BASE_URL", "DEEPSEEK_API_KEY",
+                               "DEEPSEEK_MODEL")}
     try:
         update_env(values)
     except EnvValueError as exc:
@@ -368,7 +399,8 @@ async def api_save(request: Request) -> dict:
         if not bot_restarted:
             return {"ok": False,
                     "error": "配置已保存，但内核重启失败，请到运行日志排查"}
-    return {"ok": True, "bot_restarted": bot_restarted}
+    return {"ok": True, "bot_restarted": bot_restarted,
+            "note": proxy_note or None}
 
 
 @app.post("/api/account/adopt")
@@ -674,6 +706,122 @@ async def api_plugin_uninstall(request: Request) -> dict:
             await asyncio.to_thread(_kernel_plugins):
         return {"ok": False, "error": "卸载后内核仍加载着该插件，请看运行日志"}
     return {"ok": True}
+
+
+# ---------- 反代（WorkBuddy）----------
+
+@app.get("/api/proxy")
+async def api_proxy() -> dict:
+    """反代状态 + 模型列表（Key 只用不回传）。"""
+    st = proxy_manager.status()
+    cfg = proxy_manager.config()
+    key = cfg.get("api_key") or proxy_manager.key_from_settings()
+    models: list[str] = []
+    if st["running"] and key:
+        try:
+            models = await proxy_manager.models(key)
+        except Exception:
+            models = []
+    return {"status": st,
+            "config": {"path": cfg.get("path", ""), "port": cfg.get("port", 8788),
+                       "model": cfg.get("model", "")},
+            "models": models,
+            "api_key_ready": bool(key),
+            "active_provider": _live_provider_name(load_env(ENV_FILE).get(
+                "DEEPSEEK_BASE_URL", ""))}
+
+
+@app.post("/api/proxy/config")
+async def api_proxy_config(request: Request) -> dict:
+    body = await _body_json(request)
+    cfg = proxy_manager.config()
+    path = str(body.get("path") or "").strip()
+    if path:
+        if not (Path(path) / "wb_proxy.py").exists():
+            return {"ok": False, "error": f"路径下没有 wb_proxy.py: {path}"}
+        cfg["path"] = path
+    port = str(body.get("port") or "").strip()
+    if port:
+        if not port.isdigit():
+            return {"ok": False, "error": "端口必须是数字"}
+        cfg["port"] = int(port)
+    api_key = str(body.get("api_key") or "").strip()
+    if api_key and not _looks_masked(api_key):
+        cfg["api_key"] = api_key   # 手填优先；留空=自动读 settings.json
+    proxy_manager.save_config(cfg)
+    return {"ok": True}
+
+
+@app.post("/api/proxy/start")
+async def api_proxy_start() -> dict:
+    """启动反代 → 健康校验 → 自动接入（写档案+切模型源+重启内核）。"""
+    ok, msg = await asyncio.to_thread(proxy_manager.start)
+    if not ok:
+        return {"ok": False, "error": msg}
+    cfg = proxy_manager.config()
+    key = cfg.get("api_key") or proxy_manager.key_from_settings()
+    models: list[str] = []
+    try:
+        models = await proxy_manager.models(key)
+    except Exception:
+        models = []
+    if not key or not models:
+        return {"ok": True, "activated": False, "models": models,
+                "note": "反代已启动，但还没法接入：确认 Key/账号已就绪后重试"}
+    before = load_env(ENV_FILE)
+    if not cfg.get("previous"):
+        cfg["previous"] = {"base_url": before.get("DEEPSEEK_BASE_URL", ""),
+                           "api_key": before.get("DEEPSEEK_API_KEY", ""),
+                           "model": before.get("DEEPSEEK_MODEL", "")}
+    cfg["model"] = cfg.get("model") or models[0]
+    cfg["active"] = True
+    proxy_manager.save_config(cfg)
+    profiles = _load_profiles()
+    profiles[PROXY_PROVIDER] = {"base_url": proxy_manager.base_url(),
+                                "api_key": key, "model": cfg["model"]}
+    _save_profiles(profiles)
+    update_env({"DEEPSEEK_BASE_URL": proxy_manager.base_url(),
+                "DEEPSEEK_API_KEY": key,
+                "DEEPSEEK_MODEL": cfg["model"]})
+    restarted = await _restart_kernel_if_running()
+    return {"ok": True, "activated": True, "models": models,
+            "model": cfg["model"], "restarted": restarted}
+
+
+@app.post("/api/proxy/stop")
+async def api_proxy_stop() -> dict:
+    ok, msg = await asyncio.to_thread(proxy_manager.stop)
+    cfg = proxy_manager.config()
+    prev = cfg.get("previous") or {}
+    if prev.get("base_url"):
+        try:
+            update_env({"DEEPSEEK_BASE_URL": prev["base_url"],
+                        "DEEPSEEK_API_KEY": prev.get("api_key", ""),
+                        "DEEPSEEK_MODEL": prev.get("model", "")})
+        except EnvValueError:
+            pass
+    cfg["active"] = False
+    cfg["previous"] = None
+    proxy_manager.save_config(cfg)
+    restarted = await _restart_kernel_if_running()
+    detail = msg if not ok else (msg + "；已切回直连模型源")
+    return {"ok": True, "restarted": restarted, "detail": detail}
+
+
+@app.post("/api/proxy/model")
+async def api_proxy_model(request: Request) -> dict:
+    body = await _body_json(request)
+    model = str(body.get("model") or "").strip()
+    if not model:
+        return {"ok": False, "error": "模型名不能为空"}
+    cfg = proxy_manager.config()
+    cfg["model"] = model
+    proxy_manager.save_config(cfg)
+    restarted = False
+    if cfg.get("active"):
+        update_env({"DEEPSEEK_MODEL": model})
+        restarted = await _restart_kernel_if_running()
+    return {"ok": True, "restarted": restarted}
 
 
 @app.get("/api/personas")
