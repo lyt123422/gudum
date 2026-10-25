@@ -24,6 +24,8 @@ from pathlib import Path
 
 from nonebot.log import logger
 
+from . import assistant_state
+
 ROOT = Path(__file__).resolve().parents[1]
 TOOLS_DIR = ROOT / "tools" / "adb"
 DAILY_FILE = ROOT / "data" / "douyin_daily.json"
@@ -144,25 +146,37 @@ def connect() -> tuple[bool, str]:
         if not st["adb"]:
             ok, result = download_adb()
             if not ok:
+                assistant_state.set_connected(False, result)
                 return False, result
             st = device_status()
         if not st["device"]:
-            return False, ("没看到手机：检查 USB 线、手机上「USB 调试」已开、"
-                           "并点击手机弹出的「允许 USB 调试」授权")
+            msg = ("没看到手机：检查 USB 线、手机上「USB 调试」已开、"
+                   "并点击手机弹出的「允许 USB 调试」授权")
+            assistant_state.set_connected(False, msg)
+            return False, msg
         if "未授权" in st["device"]:
-            return False, "手机弹了授权框：点「允许 USB 调试」（可勾选一律允许）"
+            msg = "手机弹了授权框：点「允许 USB 调试」（可勾选一律允许）"
+            assistant_state.set_connected(False, msg)
+            return False, msg
         if not st["douyin"]:
-            return False, "手机上没装抖音 App，先装好再连"
+            msg = "手机上没装抖音 App，先装好再连"
+            assistant_state.set_connected(False, msg)
+            return False, msg
         if not st.get("agent"):
             err = st.get("agent_error", "")
-            return False, (f"自动化代理没就绪（{err or '首次连接需在手机上确认安装提示'}），"
-                           "手机上点允许后重试一次")
+            msg = (f"自动化代理没就绪（{err or '首次连接需在手机上确认安装提示'}），"
+                   "手机上点允许后重试一次")
+            assistant_state.set_connected(False, msg)
+            return False, msg
         try:
             import uiautomator2 as u2   # noqa: PLC0415
             with _state["dev_lock"]:
                 _state["device"] = u2.connect(st["device"])
         except Exception as exc:   # noqa: BLE001
-            return False, f"连接失败：{str(exc)[:120]}"
+            msg = f"连接失败：{str(exc)[:120]}"
+            assistant_state.set_connected(False, msg)
+            return False, msg
+    assistant_state.set_connected(True)
     return True, f"✅ 手机已连接（{st['device']}），抖音已装，可以发「刷抖音」了"
 
 
@@ -237,13 +251,29 @@ def _ai_client():
     from .deepseek_api import DeepSeekClient
     from .envutil import ENV_FILE, load_env
     env = load_env(ENV_FILE)
+    base_url = env.get("DEEPSEEK_BASE_URL") or "https://api.deepseek.com"
+    model = env.get("DEEPSEEK_MODEL") or "deepseek-chat"
     # 真机决策专用：短超时+零重试（评审 v3 P1-5：否则一次决策最长 135s，
     # stop 的 8 秒 join 必然超时变成僵尸会话）
-    return DeepSeekClient(
-        base_url=env.get("DEEPSEEK_BASE_URL") or "https://api.deepseek.com",
+    client = DeepSeekClient(
+        base_url=base_url,
         api_key=env.get("DEEPSEEK_API_KEY") or "",
-        model=env.get("DEEPSEEK_MODEL") or "deepseek-chat",
+        model=model,
         timeout=30, max_retries=0, temperature=0.2)
+    _warn_model_drift(base_url, model)
+    return client
+
+
+def _warn_model_drift(base_url: str, model: str) -> None:
+    """抖音决策与聊天共用的模型配置漂移时告警（任务书 3.4）。"""
+    try:
+        from .plugins import chat as _chat   # noqa: PLC0415
+        chat_base = str(getattr(_chat.client, "base_url", "")).rstrip("/")
+        if _chat.client.model != model or chat_base != base_url.rstrip("/"):
+            logger.warning("抖音决策模型与聊天模型不一致：chat={}/{} douyin={}/{}",
+                           chat_base, _chat.client.model, base_url, model)
+    except Exception:
+        pass
 
 
 def _to_rgb_pil(img):
@@ -284,7 +314,7 @@ def _ai_decide(shot1: bytes, shot2: bytes) -> dict:
             "你在替用户刷抖音（真机，带声音），看到的是同一条视频先后两刻的屏幕截图。"
             "判断内容后决定下一步。只返回一行 JSON："
             "{\"action\":\"next|like|watch|follow\",\"watch_seconds\":<5-25的整数>,"
-            "\"reason\":\"<=15字理由\"}。"
+            "\"summary\":\"<=20字画面内容\",\"reason\":\"<=15字理由\"}。"
             "规则：普通/不感兴趣→next；内容确实出彩才 like；"
             "创作者非常对味才 follow；值得继续看→watch。宁可 next，不要滥点赞。")},
         {"role": "user", "content": [
@@ -329,7 +359,8 @@ def _ai_decide(shot1: bytes, shot2: bytes) -> dict:
     except (TypeError, ValueError):
         watch = 5
     return {"action": action, "watch": max(3, min(30, watch)),
-            "reason": str(data.get("reason", ""))[:40]}
+            "reason": str(data.get("reason", ""))[:40],
+            "summary": str(data.get("summary", ""))[:30]}
 
 
 # ---------- 真机操作 ----------
@@ -347,6 +378,8 @@ def _record_decision(d: dict) -> None:
     _recent.append(f"{name}（{d['reason']}）")
     if len(_recent) > 8:
         del _recent[:-8]
+    # 共享状态（任务书 3.2）：聊天 AI 由此获得第一人称自我认知
+    assistant_state.record_event(name, d.get("reason", ""), d.get("summary", ""))
 
 
 def _swipe_next(dev) -> None:
@@ -464,6 +497,7 @@ def _ai_session_loop(minutes: int, gen: int) -> None:
             if dev is None or not _device_alive(dev):
                 _state["last_error"] = "手机已断开，发「连接手机」重连"
                 logger.warning("{}", _state["last_error"])
+                assistant_state.set_connected(False, "手机已断开")
                 with _state["dev_lock"]:
                     _state["device"] = None
                 break
@@ -530,6 +564,8 @@ def _ai_session_loop(minutes: int, gen: int) -> None:
         _state["last_error"] = str(exc)[:200]
     finally:
         _add_daily(int((time.time() - session_start) / 60) or 1)
+        # 共享状态收尾（任务书 3.2）：无论正常结束/异常/用户停止，聊天侧都要如实
+        assistant_state.session_stopped(_state["last_error"])
 
 
 def _start_watchdog() -> None:
@@ -579,6 +615,7 @@ def start(minutes: int) -> tuple[bool, str]:
     _state["gen"] = _state["gen"] + 1   # 新会话作废一切旧循环（评审 v3 P1-3）
     _recent.clear()                     # 评审 v3 P2-15：决策记录不跨会话
     _state["last_rest"] = time.time()   # 评审 v3 P3：休息计时随会话重置
+    assistant_state.session_started(minutes)   # 共享状态：聊天 AI 的自我认知
     _state["thread"] = threading.Thread(target=_ai_session_loop,
                                         args=(minutes, _state["gen"]),
                                         daemon=True)
@@ -607,11 +644,13 @@ def pause() -> tuple[bool, str]:
     if not _alive():
         return False, "现在没在刷"
     _state["pause"].set()
+    assistant_state.set_paused(True)
     return True, "已暂停（抖音还在手机上播着，可随时「抖音继续」）"
 
 
 def resume() -> tuple[bool, str]:
     _state["pause"].clear()
+    assistant_state.set_paused(False)
     return True, "继续刷" if _alive() else "会话已结束，重新发「刷抖音」"
 
 

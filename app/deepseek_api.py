@@ -23,6 +23,7 @@ class DeepSeekClient:
                  temperature: float = 0.8):
         self.model = model
         self.temperature = temperature
+        self.base_url = base_url or "https://api.deepseek.com"
         # 空 Key 时填占位值：让请求走出去拿 401，错误信息比构造时报错更友好
         self._client = openai.AsyncOpenAI(
             base_url=base_url or "https://api.deepseek.com",
