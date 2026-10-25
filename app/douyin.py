@@ -12,10 +12,12 @@
 from __future__ import annotations
 
 import json
+import os
 import random
 import threading
 import time
 from pathlib import Path
+from urllib.parse import quote
 
 ROOT = Path(__file__).resolve().parents[1]
 PROFILE_DIR = ROOT / "data" / "douyin_profile"
@@ -55,9 +57,9 @@ def _today() -> str:
 def _daily_minutes() -> int:
     try:
         data = json.loads(DAILY_FILE.read_text(encoding="utf-8"))
-        if data.get("date") == _today():
+        if isinstance(data, dict) and data.get("date") == _today():   # 评审 P2-4
             return int(data.get("minutes", 0))
-    except (OSError, ValueError):
+    except (OSError, ValueError, TypeError):
         pass
     return 0
 
@@ -66,7 +68,9 @@ def _add_daily(minutes: int) -> None:
     data = {"date": _today(), "minutes": _daily_minutes() + max(0, minutes)}
     try:
         DAILY_FILE.parent.mkdir(parents=True, exist_ok=True)
-        DAILY_FILE.write_text(json.dumps(data), encoding="utf-8")
+        tmp = DAILY_FILE.with_suffix(".tmp")   # 评审 P2-4：原子写
+        tmp.write_text(json.dumps(data), encoding="utf-8")
+        tmp.replace(DAILY_FILE)
     except OSError:
         pass
 
@@ -94,22 +98,56 @@ def status() -> dict:
 # ---------- 浏览器 ----------
 
 def _pick_browser_path() -> str | None:
+    """优先 .env 的 CHROME_PATH，再找 Chrome/Edge（含用户级安装路径，评审 P2-5）。"""
+    from .envutil import ENV_FILE, load_env
+    configured = load_env(ENV_FILE).get("CHROME_PATH", "").strip()
+    if configured and Path(configured).exists():
+        return configured
+    local = os.environ.get("LOCALAPPDATA", "")
     candidates = [
         r"C:\Program Files\Google\Chrome\Application\chrome.exe",
         r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe",
-        r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe",
+        rf"{local}\Google\Chrome\Application\chrome.exe",
         r"C:\Program Files\Microsoft\Edge\Application\msedge.exe",
+        r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe",
+        rf"{local}\Microsoft\Edge\Application\msedge.exe",
     ]
     for path in candidates:
-        if Path(path).exists():
+        if path and Path(path).exists():
             return path
     return None
 
 
+def _page_alive(page) -> bool:
+    """DrissionPage 4.x 提供 states.is_alive；异常一律视为已死（评审 P1-2）。"""
+    try:
+        return bool(page.states.is_alive)
+    except Exception:
+        return False
+
+
+def _drop_page() -> None:
+    """调用方持锁：先摘引用再强关，page 可能已死所以异常全吞（评审 P1-2）。"""
+    page, _state["page"] = _state["page"], None
+    if page is not None:
+        try:
+            page.quit(timeout=3, force=True)
+        except Exception:
+            try:
+                page.quit()
+            except Exception:
+                pass
+
+
 def _ensure_page():
-    """在调用线程里确保浏览器已打开（browser_lock 由调用方持有）。"""
+    """在调用线程里确保浏览器已打开（browser_lock 由调用方持有）。
+
+    死页对象必须重建：用户手关 Chrome/崩溃后旧对象仍非 None（评审 P1-2）。
+    """
     if _state["page"] is not None:
-        return _state["page"]
+        if _page_alive(_state["page"]):
+            return _state["page"]
+        _drop_page()
     from DrissionPage import ChromiumOptions, ChromiumPage
     options = ChromiumOptions()
     browser = _pick_browser_path()
@@ -120,10 +158,22 @@ def _ensure_page():
     options.set_argument("--start-maximized")
     options.set_argument("--disable-blink-features=AutomationControlled")
     page = ChromiumPage(options)
-    page.get("https://www.douyin.com/?recommend=1")
+    try:   # 评审 P2-6：显式超时，避免任何一步把遥控线程挂死
+        page.set.timeouts(base=10, page_load=20, script=10)
+    except Exception:
+        pass
+    try:
+        loaded = page.get("https://www.douyin.com/?recommend=1", timeout=20)
+    except Exception as exc:
+        _state["page"] = page
+        _drop_page()
+        raise RuntimeError(f"浏览器启动失败：{str(exc)[:120]}") from exc
+    if not loaded:
+        _state["page"] = page
+        _drop_page()
+        raise RuntimeError("抖音页面加载失败（网络/风控），已关闭浏览器")
     _state["page"] = page
     _start_watchdog()
-    time.sleep(2)
     return page
 
 
@@ -181,8 +231,9 @@ def _browse_comments(page) -> bool:
         time.sleep(random.uniform(1, 2.5))
     # 再点一次关闭（评论按钮是开关），失败按 Esc 兜底
     _find_and_click(page, _COMMENT_OPEN)
-    try:
-        page.actions.key("Escape")
+    try:   # 评审 P1-3：actions.key 不存在，用 key_down/key_up
+        page.actions.key_down("Escape")
+        page.actions.key_up("Escape")
     except Exception:
         pass
     time.sleep(random.uniform(0.5, 1))
@@ -190,18 +241,23 @@ def _browse_comments(page) -> bool:
 
 
 def _visit_author(page) -> bool:
-    """点进当前作者主页逛几秒作品列表再回来。"""
+    """点进当前作者主页逛几秒作品列表再回来（新标签页要收拾，评审 P2-2）。"""
     for sel in _AUTHOR_LINKS:
         try:
             ele = page.ele(f"css:{sel}", timeout=0.5)
             if not ele:
                 continue
+            before = page.tabs_count
             ele.click()
             time.sleep(random.uniform(3, 6))
+            if page.tabs_count > before:   # 新标签页打开的：关掉多余标签
+                page.close_tabs(others=True)
             page.scroll.down(random.randint(200, 500))
             time.sleep(random.uniform(1.5, 3))
             page.back()
             time.sleep(random.uniform(1, 2))
+            if "douyin.com" not in (page.url or ""):   # 不在推荐流就送回去
+                page.get("https://www.douyin.com/?recommend=1", timeout=20)
             return True
         except Exception:
             continue
@@ -223,11 +279,17 @@ def _scroll_loop(minutes: int) -> None:
                 time.sleep(min(0.5, max(0.05, wait_end - time.time())))
             if stop.is_set():
                 break
-            with _state["browser_lock"]:
+            if _state["pause"].is_set():
+                continue   # 暂停时不执行"最后一次动作"（评审 P2-1）
+            with _state["browser_lock"]:   # 锁只做校验和取引用（评审 P1-2.7）
                 page = _state["page"]
                 if page is None:
                     break
-                # 行为抽签（借鉴散步模式）：大概率刷下一条，小概率翻评论区/进主页
+                if not _page_alive(page):
+                    _drop_page()
+                    break
+            # 动作与睡眠都在锁外：status/stop 不被 5~15 秒睡眠卡住
+            try:
                 roll = random.random()
                 browsed = False
                 if roll < 0.08:
@@ -245,6 +307,12 @@ def _scroll_loop(minutes: int) -> None:
                     ok, _ = _find_and_click(page, _LIKE_SELECTORS)
                     if ok:
                         time.sleep(random.uniform(0.8, 1.6))
+            except Exception as exc:   # noqa: BLE001
+                _state["last_error"] = str(exc)[:200]
+                with _state["browser_lock"]:
+                    if _state["page"] is not None and not _page_alive(_state["page"]):
+                        _drop_page()
+                break
     except Exception as exc:   # noqa: BLE001
         _state["last_error"] = str(exc)[:200]
     finally:
@@ -259,11 +327,18 @@ def _start_watchdog() -> None:
         while True:
             time.sleep(60)
             with _state["browser_lock"]:
-                if _state["page"] is None:
+                page = _state["page"]
+                if page is None:
                     continue
-                if time.time() - _state["last_active"] > IDLE_CLOSE_MIN * 60 \
-                        and not _alive():
-                    _close_page()   # 没在刷又没人操控：关掉省资源
+                # 只看活跃时间（评审 P1-2.5）：不再要求自动刷已结束，
+                # 否则"暂停 + 挂机"永远关不掉浏览器
+                if time.time() - _state["last_active"] > IDLE_CLOSE_MIN * 60:
+                    if _page_alive(page):
+                        try:
+                            page.quit(timeout=3, force=True)
+                        except Exception:
+                            pass
+                    _state["page"] = None
 
     _state["watchdog"] = threading.Thread(target=_watch, daemon=True)
     _state["watchdog"].start()
@@ -273,6 +348,8 @@ def _start_watchdog() -> None:
 
 def start(minutes: int) -> tuple[bool, str]:
     with _state["browser_lock"]:
+        if _state["thread"] and not _state["thread"].is_alive():
+            _state["thread"] = None   # 清理已结束的旧线程引用
         if _alive():
             return False, "已经在刷了，发「抖音暂停」或「停止抖音」"
         minutes = max(1, min(minutes, MAX_SESSION_MIN))
@@ -300,6 +377,11 @@ def start(minutes: int) -> tuple[bool, str]:
 
 def stop() -> tuple[bool, str]:
     _state["stop"].set()
+    thread = _state["thread"]
+    if thread and thread.is_alive():
+        thread.join(timeout=5)   # 评审 P1-2.8：等刷视频线程收尾
+    _state["thread"] = None
+    _state["plan_min"] = 0
     with _state["browser_lock"]:
         had = _state["page"] is not None
         _close_page()
@@ -329,6 +411,8 @@ def _act(fn):
             return fn(page)
         except Exception as exc:   # noqa: BLE001
             _state["last_error"] = str(exc)[:200]
+            if not _page_alive(page):   # page 已死：清掉，下次重建（评审 P1-2.4）
+                _drop_page()
             return False, f"操作失败：{str(exc)[:120]}"
         finally:
             _touch()
@@ -360,20 +444,62 @@ def follow_current() -> tuple[bool, str]:
     return _act(_do)
 
 
+def _deep_input(page, selectors: list[str], text: str) -> bool:
+    """一次 JS 完成：递归穿透 shadow DOM 找输入框 → focus → 写入 → 派发 input
+    事件（评审 P1-3：_find_and_click 拿到的 shadow 命中串不是合法 CSS，不能复用）。"""
+    js = """
+    const deep = (root, sel) => {
+      let el = root.querySelector(sel);
+      if (el) return el;
+      for (const n of root.querySelectorAll('*')) {
+        if (n.shadowRoot) { const f = deep(n.shadowRoot, sel); if (f) return f; }
+      } return null; };
+    for (const sel of arguments[0]) {
+      const el = deep(document, sel);
+      if (el) {
+        el.focus();
+        if (el.isContentEditable) { el.textContent = arguments[1]; }
+        else { el.value = arguments[1]; }
+        el.dispatchEvent(new InputEvent('input', {bubbles: true}));
+        return sel;
+      }
+    }
+    return '';
+    """
+    try:
+        return bool(page.run_js(js, selectors, text))
+    except Exception:
+        return False
+
+
+def _press_enter(page) -> None:
+    """对当前聚焦元素派发回车（提交按钮选择器不匹配时的兜底）。"""
+    js = """
+    const el = document.activeElement || document.body;
+    for (const type of ['keydown', 'keyup']) {
+      el.dispatchEvent(new KeyboardEvent(type, {key: 'Enter', keyCode: 13,
+        which: 13, bubbles: true, cancelable: true}));
+    }
+    """
+    try:
+        page.run_js(js)
+    except Exception:
+        pass
+
+
 def comment(text: str) -> tuple[bool, str]:
     if not text or len(text) > 200:
         return False, "评论内容为空或超过 200 字"
 
     def _do(page):
-        ok, hit = _find_and_click(page, _COMMENT_INPUTS)
-        if not ok:
-            return False, "没找到评论框（试「抖音截图」看看）"
+        _find_and_click(page, _COMMENT_INPUTS)   # 点开/聚焦（失败交给 deep_input）
         time.sleep(0.5)
-        page.ele(f"css:{hit}").input(text)
+        if not _deep_input(page, _COMMENT_INPUTS, text):
+            return False, "没找到评论框（试「抖音截图」看看）"
         time.sleep(0.4)
         done, _ = _find_and_click(page, ['[data-e2e="comment-submit"]'])
         if not done:   # 有的版本没有提交按钮，回车提交
-            page.ele(f"css:{hit}").input("\n")
+            _press_enter(page)
         return True, f"已发出评论：「{text[:40]}」"
     return _act(_do)
 
@@ -383,7 +509,9 @@ def search(keyword: str) -> tuple[bool, str]:
         return False, "要搜什么？用法：抖音搜索 关键词"
 
     def _do(page):
-        page.get(f"https://www.douyin.com/search/{keyword}")
+        # 关键词必须 URL 编码，中文/特殊字符直拼会 400（评审 P2-3）
+        page.get(f"https://www.douyin.com/search/"
+                 f"{quote(keyword.strip()[:50], safe='')}", timeout=20)
         time.sleep(2)
         page.scroll.down(random.randint(300, 600))
         return True, f"已搜索「{keyword}」，正在看搜索结果（发「刷抖音 分钟」可持续刷）"

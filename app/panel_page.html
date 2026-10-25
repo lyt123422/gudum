@@ -235,7 +235,7 @@ pre{background:#0f172a;color:#bbf7d0;font-size:12px;padding:14px;border-radius:1
    <div class="row">
     <button class="green" id="b-bs" onclick="api('bot/start',event)">▶ 启动</button>
     <button class="red" id="b-bx" onclick="api('bot/stop',event)">⏹ 停止</button>
-    <button class="ghost" onclick="window.open('http://127.0.0.1:8081/healthz')">healthz</button>
+    <button class="ghost" onclick="window.open('http://127.0.0.1:'+(S.bot_port||8081)+'/healthz')">healthz</button>
    </div>
   </div>
   <div class="card">
@@ -340,7 +340,8 @@ async function loadCfg(force){
  const c=await(await fetch('/api/config')).json();
  $('f-base').value=c.base_url;maskedKey=c.api_key||'';$('f-key').value=maskedKey;
  $('f-model').value=c.model;
- $('f-account').value=c.napcat_account;$('f-su').value=c.superuser;
+ $('f-account').value=c.napcat_account;
+ $('f-su').value=(c.superusers||[]).join('，');
  $('pass-state').textContent=c.napcat_password_set?'（已设置，免扫码）':'';
  $('s-persona').textContent=c.persona_name||'-';
  liveProv=c.live_provider||'自定义';
@@ -355,12 +356,13 @@ async function pollPersonaName(){   // 周期任务只刷总览人设名，绝�
 async function loadProviders(){
  const d=await(await fetch('/api/providers')).json();
  PRESETS=d.presets||{};PROFILES=d.saved||{}}
-function fillProvider(k){   // 切换提供商=加载它自己的档案；Key 各存各的，绝不串槽
+function fillProvider(k){   // 切换=载入该家档案；Key 不回填掩码（评审 P0-1）
  curProv=k;cfgDirty=true;
  const saved=PROFILES[k]||{},preset=PRESETS[k]||{};
  $('f-base').value=saved.base_url||preset.base_url||'';
  $('f-model').value=saved.model||preset.model||'';
- $('f-key').value=saved.api_key||'';
+ $('f-key').value='';maskedKey='';
+ $('f-key').placeholder='已保存 Key（留空=不修改，输入则覆盖）';
  renderProvs()}
 function renderProvs(){const box=$('provs');box.innerHTML='';
  Object.keys(PRESETS).forEach(k=>{const d=document.createElement('div');
@@ -383,6 +385,7 @@ async function saveCfg(){
  if(j.ok){cfgDirty=false;
   if(curProv)PROFILES[curProv]={base_url:$('f-base').value,api_key:$('f-key').value,
    model:$('f-model').value};
+  loadProviders();   // 评审 P0-1：刷新客户端档案缓存（掩码已变）
   loadCfg(true)}}   // 保存成功后才回填并同步提供商高亮
 async function testApi(){
  msg('cfg-msg','正在调用模型测试…','');
@@ -529,13 +532,15 @@ async function togglePlugin(id,en){
  await fetch('/api/plugin/toggle',{method:'POST',
   headers:{'Content-Type':'application/json'},body:JSON.stringify({id:id,enabled:en})});
  loadPlugins()}
+let installing=false;   // 评审 P2-8：安装期间禁止重复点击
 async function installPlugin(pip){
- msg('pl-msg','⏳ 正在下载安装 '+pip+'（可能要一两分钟，别关页面）…','');
- const j=await(await fetch('/api/plugin/install',{method:'POST',
-  headers:{'Content-Type':'application/json'},body:JSON.stringify({pip:pip})})).json();
- msg('pl-msg',j.ok?('✅ 安装成功'+(j.restarted?'，内核已重启加载（QQ 不受影响）':'（内核未运行，下次启动生效）'))
-   :'❌ '+(j.error||'安装失败'),j.ok?'ok':'err');
- loadPlugins()}
+ if(installing)return;installing=true;
+ try{msg('pl-msg','⏳ 正在下载安装 '+pip+'（可能要一两分钟，别关页面）…','');
+  const j=await(await fetch('/api/plugin/install',{method:'POST',
+   headers:{'Content-Type':'application/json'},body:JSON.stringify({pip:pip})})).json();
+  msg('pl-msg',j.ok?('✅ 安装成功'+(j.restarted?'，内核已重启加载（QQ 不受影响）':'（内核未运行，下次启动生效）'))
+    :'❌ '+(j.error||'安装失败'),j.ok?'ok':'err');
+  loadPlugins()}finally{installing=false}}
 async function uninstallPlugin(pip){
  if(!confirm('确定卸载 '+pip+' ？'))return;
  msg('pl-msg','⏳ 卸载中…','');

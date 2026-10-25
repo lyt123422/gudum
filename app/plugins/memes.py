@@ -9,20 +9,24 @@ from __future__ import annotations
 
 import re
 import time
+from pathlib import Path
 
 import httpx
 from nonebot import logger, on_command
 from nonebot.adapters.onebot.v11 import Bot, Message, MessageEvent, MessageSegment
 from nonebot.params import CommandArg
 
-from .. import plugin_manager
+from .. import plugin_manager, vision
 from ..envutil import ROOT
+from .chat import _cmd_gate
 
 MEME_DIR = ROOT / "data" / "memes"
 
-cmd_save = on_command("存表情", priority=4, block=True)
-cmd_meme = on_command("表情包", aliases={"斗图", "来个表情"}, priority=4, block=True)
-cmd_list = on_command("表情列表", aliases={"表情包列表"}, priority=4, block=True)
+cmd_save = on_command("存表情", rule=_cmd_gate, priority=4, block=True)
+cmd_meme = on_command("表情包", aliases={"斗图", "来个表情"},
+                      rule=_cmd_gate, priority=4, block=True)
+cmd_list = on_command("表情列表", aliases={"表情包列表"},
+                      rule=_cmd_gate, priority=4, block=True)
 
 
 async def _meme_enabled(matcher) -> bool:
@@ -35,6 +39,12 @@ async def _meme_enabled(matcher) -> bool:
 
 def _safe_name(name: str) -> str:
     return re.sub(r"[^\w\u4e00-\u9fff-]", "_", name.strip())[:30]
+
+
+def _meme_files() -> list[Path]:
+    MEME_DIR.mkdir(parents=True, exist_ok=True)
+    return sorted(f for f in MEME_DIR.iterdir()
+                  if f.suffix.lower() in (".jpg", ".png", ".gif", ".webp"))
 
 
 async def _image_url_from_reply(bot: Bot, event: MessageEvent) -> str | None:
@@ -67,6 +77,9 @@ async def _(matcher, bot: Bot, event: MessageEvent, args: Message = CommandArg()
     url = await _image_url_from_reply(bot, event)
     if not url:
         await matcher.finish("用法：回复一条带图的消息，发「存表情 名字」（名字可省略）")
+    if not vision.host_allowed(url):
+        # 评审 P2-18：只收 QQ 聊天图，不让面板/机器人当任意下载器
+        await matcher.finish("只收录 QQ 聊天里的图片")
     name = _safe_name(args.extract_plain_text() or f"meme_{int(time.time())}")
     try:
         async with httpx.AsyncClient(timeout=15, follow_redirects=True) as client:
@@ -76,20 +89,24 @@ async def _(matcher, bot: Bot, event: MessageEvent, args: Message = CommandArg()
     except Exception as exc:
         logger.warning("表情包下载失败: {}", exc)
         await matcher.finish("表情下载失败，稍后再试")
+    mime = vision.sniff_mime(data)   # 评审 P2-18：魔数判真实格式
+    if not mime:
+        await matcher.finish("这不是常见图片格式（jpg/png/gif/webp），没收")
     if len(data) < 200 or len(data) > 10 * 1024 * 1024:
         await matcher.finish("这张图好像不太对（太小或超过 10MB），没收")
     MEME_DIR.mkdir(parents=True, exist_ok=True)
-    path = MEME_DIR / f"{name}.jpg"
+    ext = mime.split("/")[1].replace("jpeg", "jpg")
+    path = MEME_DIR / f"{name}.{ext}"
     path.write_bytes(data)
-    await matcher.finish(f"🧩 已收藏表情「{name}」（库里现有 {len(list(MEME_DIR.glob('*.jpg')))} 张）")
+    await matcher.finish(
+        f"🧩 已收藏表情「{name}」（库里现有 {len(_meme_files())} 张）")
 
 
 @cmd_meme.handle()
 async def _(matcher, args: Message = CommandArg()):  # noqa: B008
     await _meme_enabled(matcher)
-    MEME_DIR.mkdir(parents=True, exist_ok=True)
     keyword = _safe_name(args.extract_plain_text())
-    files = sorted(MEME_DIR.glob("*.jpg"))
+    files = _meme_files()
     if keyword:
         files = [f for f in files if keyword in f.stem] or files
     if not files:
@@ -101,8 +118,7 @@ async def _(matcher, args: Message = CommandArg()):  # noqa: B008
 @cmd_list.handle()
 async def _(matcher):
     await _meme_enabled(matcher)
-    MEME_DIR.mkdir(parents=True, exist_ok=True)
-    names = [f.stem for f in sorted(MEME_DIR.glob("*.jpg"))]
+    names = [f.stem for f in _meme_files()]
     if not names:
         await matcher.finish("表情库是空的，用「存表情」收录第一张吧")
     await matcher.finish("🧩 表情库（{}）：{}".format(

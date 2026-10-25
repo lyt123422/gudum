@@ -199,7 +199,11 @@ def load_all() -> dict[str, Persona]:
     result: dict[str, Persona] = {}
     for path in sorted(PERSONA_DIR.glob("*.txt")):
         try:
-            raw = path.read_text(encoding="utf-8")
+            try:
+                raw = path.read_text(encoding="utf-8-sig")
+            except UnicodeDecodeError:
+                # 记事本另存 ANSI/GBK 的人设也能读（评审 P2-19）
+                raw = path.read_text(encoding="gbk", errors="replace")
         except OSError:
             continue
         persona = parse_persona(raw, path.stem)
@@ -257,5 +261,7 @@ def set_persona_text(name: str, new_text: str) -> None:
         updated = re.sub(r"\[人设\]\n.*?(?=\n\[|\Z)", block, persona.raw, flags=re.S)
     else:
         updated = persona.raw.rstrip() + "\n\n" + block
-    persona.path.write_text(updated, encoding="utf-8")
+    tmp = persona.path.with_suffix(".tmp")   # 评审 P2-19：原子写
+    tmp.write_text(updated, encoding="utf-8")
+    tmp.replace(persona.path)
     invalidate()

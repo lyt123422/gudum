@@ -28,7 +28,7 @@ ROOT = Path(__file__).resolve().parents[1]
 _PAGE_PATH = Path(__file__).resolve().parent / "panel_page.html"
 ENV_FILE = ROOT / ".env"
 PANEL_PORT = 8090
-BOT_PORT = 8081
+BOT_PORT = int(load_env(ENV_FILE).get("PORT") or "8081")   # 评审 P2-11：跟随 .env
 VENV_PY = ROOT / ".venv" / "Scripts" / "python.exe"
 QR_PATH = ROOT / "napcat" / "napcat" / "cache" / "qrcode.png"
 LOG_DIR = ROOT / "data" / "logs"
@@ -108,6 +108,11 @@ def _mask(key: str) -> str:
     return key[:6] + "…" + key[-4:] if len(key) > 12 else ("…" if key else "")
 
 
+def _looks_masked(key: str) -> bool:
+    """掩码 Key（如 sk-b23…23e8）不是真 Key，写回会覆盖真值（评审 P0-1）。"""
+    return "…" in key or "..." in key
+
+
 @app.middleware("http")
 async def _guard(request: Request, call_next):
     """本机 + 跨站双层防护（评审 P0-1）。
@@ -130,11 +135,13 @@ async def _guard(request: Request, call_next):
             return JSONResponse({"error": "跨站请求被拒绝"}, status_code=403)
     response = await call_next(request)
     response.headers.setdefault("X-Content-Type-Options", "nosniff")
+    response.headers.setdefault("X-Frame-Options", "DENY")   # 评审 P2-13
     if request.url.path == "/":
         response.headers.setdefault(
             "Content-Security-Policy",
             "default-src 'self'; script-src 'self' 'unsafe-inline'; "
-            "style-src 'self' 'unsafe-inline'; img-src 'self' data:")
+            "style-src 'self' 'unsafe-inline'; img-src 'self' data:; "
+            "frame-ancestors 'none'")
     return response
 
 
@@ -225,6 +232,10 @@ async def api_providers() -> dict:
 async def api_config() -> dict:
     env = load_env(ENV_FILE)
     active = personas.get_active()
+    try:
+        su_list = [str(x) for x in json.loads(env.get("SUPERUSERS", "[]"))]
+    except ValueError:
+        su_list = [s for s in env.get("SUPERUSERS", "").strip('[]" ').split(",") if s]
     return {"base_url": env.get("DEEPSEEK_BASE_URL", ""),
             "api_key": _mask(env.get("DEEPSEEK_API_KEY", "")),
             "api_key_set": bool(env.get("DEEPSEEK_API_KEY")),
@@ -233,7 +244,7 @@ async def api_config() -> dict:
             "persona_name": active.name,
             "napcat_account": env.get("NAPCAT_ACCOUNT", ""),
             "napcat_password_set": bool(env.get("NAPCAT_QUICK_PASSWORD")),
-            "superuser": (env.get("SUPERUSERS", "").strip("[]\" ").split(",") or [""])[0]}
+            "superusers": su_list}   # 评审 P2-10：完整列表，前端逗号分隔编辑
 
 
 async def _body_json(request: Request) -> dict:
@@ -251,6 +262,7 @@ async def _body_json(request: Request) -> dict:
 @app.post("/api/save")
 async def api_save(request: Request) -> dict:
     body = await _body_json(request)
+    before = load_env(ENV_FILE)   # 评审 P1-1：在任何写入之前快照，changed 才可信
     provider = str(body.get("provider") or "").strip()
     if provider and provider not in PROVIDER_PRESETS:
         return {"ok": False, "error": f"未知的提供商: {provider}"}
@@ -260,10 +272,16 @@ async def api_save(request: Request) -> dict:
                  "napcat_password": "NAPCAT_QUICK_PASSWORD"}
     values = {env_key: str(body.get(k)).strip() for k, env_key in field_map.items()
               if body.get(k)}
+    if values.get("DEEPSEEK_API_KEY") and _looks_masked(values["DEEPSEEK_API_KEY"]):
+        return {"ok": False, "error": "检测到掩码 Key：请输入新 Key，或留空保持不变"}
     superuser = str(body.get("superuser") or "").strip()
+    # 管理员支持逗号分隔多人（评审 P2-10）
+    admin_list = ([s.strip() for s in re.split(r"[,，、\s]+", superuser) if s.strip()]
+                  if superuser else [])
+    bad = [s for s in admin_list if not s.isdigit()]
+    if bad:
+        return {"ok": False, "error": f"管理员 QQ 必须是纯数字: {', '.join(bad)}"}
     # 字段合法性（评审 P1-5）：数字字段、URL 协议
-    if superuser and not superuser.isdigit():
-        return {"ok": False, "error": "管理员 QQ 必须是纯数字"}
     if values.get("NAPCAT_ACCOUNT") and not values["NAPCAT_ACCOUNT"].isdigit():
         return {"ok": False, "error": "QQ 号必须是纯数字"}
     if values.get("DEEPSEEK_BASE_URL") and not \
@@ -273,8 +291,7 @@ async def api_save(request: Request) -> dict:
         base_url = values.get("DEEPSEEK_BASE_URL", "")
         if not base_url:
             return {"ok": False, "error": "Base URL 不能为空"}
-        # 该提供商档案独立保存；Key/模型留空时沿用档案里的旧值（评审 P2-13：
-        # 保存其余字段不允许把已存 Key 抹掉）
+        # 该提供商档案独立保存；Key/模型留空时沿用档案里的旧值（评审 P2-13）
         profiles = _load_profiles()
         old_profile = profiles.get(provider, {})
         new_key = values.get("DEEPSEEK_API_KEY") or old_profile.get("api_key", "")
@@ -289,8 +306,8 @@ async def api_save(request: Request) -> dict:
         values["DEEPSEEK_BASE_URL"] = base_url
         values["DEEPSEEK_API_KEY"] = new_key
         values["DEEPSEEK_MODEL"] = new_model
-    if superuser:
-        values["SUPERUSERS"] = f'["{superuser}"]'
+    if admin_list:
+        values["SUPERUSERS"] = json.dumps(admin_list, ensure_ascii=False)
     try:
         update_env(values)
     except EnvValueError as exc:
@@ -301,14 +318,18 @@ async def api_save(request: Request) -> dict:
             personas.set_persona_text(personas.active_name(), persona_text)
         except (KeyError, OSError) as exc:
             return {"ok": False, "error": f"人设保存失败: {exc}"}
-    # 配置在内核启动时读取：DEEPSEEK_* 有实际变化才重启，避免无谓断连
-    before = load_env(ENV_FILE)
-    kernel_keys = ("DEEPSEEK_BASE_URL", "DEEPSEEK_API_KEY", "DEEPSEEK_MODEL")
+    # 内核启动时读配置：DEEPSEEK_*/SUPERUSERS 真变化才重启，避免无谓断连（评审 P1-1）
+    restart_keys = ("DEEPSEEK_BASE_URL", "DEEPSEEK_API_KEY", "DEEPSEEK_MODEL",
+                    "SUPERUSERS")
     changed = any(values.get(k) is not None and values.get(k, "") != before.get(k, "")
-                  for k in kernel_keys)
-    if _running("bot") and changed:
-        await asyncio.to_thread(_spawn, "bot", "app.main", BOT_OUT)
-    return {"ok": True, "bot_restarted": bool(_running("bot") and changed)}
+                  for k in restart_keys)
+    bot_restarted = False
+    if changed and (_running("bot") or _pid_on_port(BOT_PORT)):
+        bot_restarted = await _restart_kernel_if_running()
+        if not bot_restarted:
+            return {"ok": False,
+                    "error": "配置已保存，但内核重启失败，请到运行日志排查"}
+    return {"ok": True, "bot_restarted": bot_restarted}
 
 
 @app.post("/api/account/adopt")
@@ -331,8 +352,14 @@ async def api_test(request: Request) -> dict:
     env = load_env(ENV_FILE)
     base = (str(body.get("base_url") or "") or env.get("DEEPSEEK_BASE_URL", "")).strip()
     key = (str(body.get("api_key") or "")).strip()
-    # 出于安全（评审 P0-1）：只有"测试当前已保存的地址"才允许用已存 Key；
-    # 未知地址必须显式提供 Key，防止借测试接口把 Key 发往任意地址
+    if not key:
+        # 评审 P0-1：只查用户自己保存的 provider 档案（按 base_url 匹配），
+        # 绝不把 Key 发往档案之外的地址
+        for profile in _load_profiles().values():
+            if profile.get("base_url", "").rstrip("/") == base.rstrip("/") \
+                    and profile.get("api_key"):
+                key = profile["api_key"]
+                break
     if not key and base.rstrip("/") == env.get("DEEPSEEK_BASE_URL", "").strip().rstrip("/"):
         key = env.get("DEEPSEEK_API_KEY", "").strip()
     if not key:
@@ -385,15 +412,70 @@ async def api_plugin_toggle(request: Request) -> dict:
     plugin_id = str(body.get("id") or "").strip()
     if not plugin_id:
         return {"ok": False, "error": "缺少插件 id"}
-    ok = plugin_manager.set_enabled(plugin_id, bool(body.get("enabled")))
-    return {"ok": ok, "error": None if ok else "没有这个插件"}
+    enabled = bool(body.get("enabled"))
+    ok = plugin_manager.set_enabled(plugin_id, enabled)
+    if not ok:
+        return {"ok": False, "error": "没有这个插件"}
+    # 第三方插件的启用/停用需要真重启内核才生效（评审 P1-4）；内置插件运行时生效
+    if plugin_id in plugin_manager.thirdparty_pips() and enabled != (
+            plugin_manager.module_of(plugin_id) in await asyncio.to_thread(_kernel_plugins)):
+        if not await _restart_kernel_if_running():
+            return {"ok": False, "error": "内核重启失败，插件状态可能未生效，请看运行日志"}
+    return {"ok": True}
+
+
+def _kernel_identity_ok(pid: int) -> bool:
+    """校验端口上的进程确实是本项目内核（healthz pid 或命令行含 app.main）。"""
+    try:
+        resp = httpx.get(f"http://127.0.0.1:{BOT_PORT}/healthz", timeout=1.5)
+        if resp.status_code == 200 and resp.json().get("pid") == pid:
+            return True
+    except Exception:
+        pass
+    try:
+        out = subprocess.run(
+            ["powershell", "-NoProfile", "-Command",
+             f"(Get-CimInstance Win32_Process -Filter 'ProcessId={pid}').CommandLine"],
+            capture_output=True, text=True, errors="replace", timeout=8).stdout or ""
+        return "app.main" in out
+    except Exception:
+        return False
 
 
 async def _restart_kernel_if_running() -> bool:
-    if not (_running("bot") or _pid_on_port(BOT_PORT)):
+    """真重启（评审 P1-4）：找旧内核→校验身份→停→等端口释放→拉起→轮询 healthz。"""
+    pid = await asyncio.to_thread(_pid_on_port, BOT_PORT)
+    if pid and not await asyncio.to_thread(_kernel_identity_ok, pid):
+        return False   # 端口被陌生进程占用：宁可不动作，也不误杀
+    if not (_running("bot") or pid is not None):
         return False
+    await asyncio.to_thread(_stop, "bot")
+    if pid:
+        await asyncio.to_thread(_kill_pid, pid)
+    for _ in range(20):   # 最多等 10 秒端口释放
+        if _pid_on_port(BOT_PORT) is None:
+            break
+        await asyncio.sleep(0.5)
     await asyncio.to_thread(_spawn, "bot", "app.main", BOT_OUT)
-    return True
+    for _ in range(40):   # 最多等 20 秒起来
+        try:
+            resp = await asyncio.to_thread(
+                httpx.get, f"http://127.0.0.1:{BOT_PORT}/healthz", timeout=1.5)
+            if resp.status_code == 200:
+                return True
+        except Exception:
+            pass
+        await asyncio.sleep(0.5)
+    return False
+
+
+def _kernel_plugins() -> list[str]:
+    """当前内核已加载的插件名（healthz.plugins）。"""
+    try:
+        resp = httpx.get(f"http://127.0.0.1:{BOT_PORT}/healthz", timeout=2)
+        return list(resp.json().get("plugins") or [])
+    except Exception:
+        return []
 
 
 @app.post("/api/plugin/install")
@@ -405,10 +487,15 @@ async def api_plugin_install(request: Request) -> dict:
     ok, log = await asyncio.to_thread(plugin_manager.install, pip_name)
     if not ok:
         return {"ok": False, "error": f"安装失败：{log[-200:]}"}
-    # 本地插件是运行时开关，不用重启；第三方 pip 插件需要重启内核加载
+    # 本地插件是运行时开关，不用重启；第三方 pip 插件真重启后验证已加载（评审 P1-4）
     restarted = False
     if not pip_name.startswith("local:"):
         restarted = await _restart_kernel_if_running()
+        if restarted and plugin_manager.module_of(pip_name) not in \
+                await asyncio.to_thread(_kernel_plugins):
+            return {"ok": False,
+                    "error": f"重启后 {plugin_manager.module_of(pip_name)} "
+                             "未出现在内核插件列表，请看运行日志"}
     return {"ok": True, "restarted": restarted, "log": log[-200:]}
 
 
@@ -419,7 +506,9 @@ async def api_plugin_uninstall(request: Request) -> dict:
     ok, log = await asyncio.to_thread(plugin_manager.uninstall, pip_name)
     if not ok:
         return {"ok": False, "error": f"卸载失败：{log[-200:]}"}
-    await _restart_kernel_if_running()
+    if await _restart_kernel_if_running() and plugin_manager.module_of(pip_name) in \
+            await asyncio.to_thread(_kernel_plugins):
+        return {"ok": False, "error": "卸载后内核仍加载着该插件，请看运行日志"}
     return {"ok": True}
 
 
@@ -576,9 +665,11 @@ async def api_status() -> dict:
     code_path = ROOT / "data" / "claim_code.txt"
     if code_path.exists():
         try:
-            code = code_path.read_text(encoding="utf-8").strip()
-            if len(code) == 6 and code.isdigit():
-                claim_code = code
+            # 过期码不展示（10 分钟有效，与内核口径一致）
+            if time.time() - code_path.stat().st_mtime < 600:
+                code = code_path.read_text(encoding="utf-8").strip()
+                if len(code) == 6 and code.isdigit():
+                    claim_code = code
         except OSError:
             pass
     mem_dir = ROOT / "data" / "memory"

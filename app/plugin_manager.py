@@ -12,6 +12,7 @@ from __future__ import annotations
 import json
 import subprocess
 import sys
+import threading
 import time
 from pathlib import Path
 
@@ -39,20 +40,25 @@ MARKET: list[dict] = [
      "desc": "QQ 遥控本机浏览器刷抖音（高自由度）：自动刷+点赞/评论/关注/搜索/"
              "截图全遥控，扫码登录一次。随机停留/滑动像真人；限单次60分钟/每日120分钟，"
              "管理员专用"},
-    {"pip": "nonebot-plugin-htmlrender", "name": "HTML 渲染图片",
+    {"pip": "nonebot-plugin-htmlrender", "module": "nonebot_plugin_htmlrender",
+     "name": "HTML 渲染图片", "cat": "底座",
      "desc": "把网页/HTML 渲染成图片的底座组件。单独装没有对话功能，"
-             "其他插件（日报、卡片类）会依赖它", "cat": "底座"},
-    {"pip": "nonebot-plugin-apscheduler", "name": "定时任务",
-     "desc": "cron 定时器底座，开发者向。普通用户装了没有直接可玩的功能", "cat": "底座"},
-    {"pip": "nonebot-plugin-moegoe", "name": "原神角色语音",
+             "其他插件（日报、卡片类）会依赖它"},
+    {"pip": "nonebot-plugin-apscheduler", "module": "nonebot_plugin_apscheduler",
+     "name": "定时任务", "cat": "底座",
+     "desc": "cron 定时器底座，开发者向。普通用户装了没有直接可玩的功能"},
+    {"pip": "nonebot-plugin-moegoe", "module": "nonebot_plugin_moegoe",
+     "name": "原神角色语音", "cat": "语音",
      "desc": "VITS 角色音色合成，比 edge-tts 更有角色感。装后用它的指令"
-             "（如 原神语音），首次使用可能要下载模型", "cat": "语音"},
-    {"pip": "nonebot-plugin-random", "name": "随机素材",
+             "（如 原神语音），首次使用可能要下载模型"},
+    {"pip": "nonebot-plugin-random", "module": "nonebot_plugin_random",
+     "name": "随机素材", "cat": "娱乐",
      "desc": "随机发图/语音/视频。装完需要自己往 data/random 放素材，"
-             "否则没内容可发", "cat": "娱乐"},
-    {"pip": "nonebot-plugin-chatgpt", "name": "ChatGPT 对话",
+             "否则没内容可发"},
+    {"pip": "nonebot-plugin-chatgpt", "module": "nonebot_plugin_chatgpt",
+     "name": "ChatGPT 对话", "cat": "AI",
      "desc": "⚠ 另一套 LLM 对话：装完要在 .env 配它的 API Key 才能用，"
-             "且会和内置聊天抢消息（二选一，想用先关内置聊天）", "cat": "AI"},
+             "且会和内置聊天抢消息（二选一，想用先关内置聊天）"},
 ]
 
 _MARKET_PIPS = {item["pip"] for item in MARKET}
@@ -106,10 +112,25 @@ def set_enabled(plugin_id: str, enabled: bool) -> bool:
 
 
 def enabled_thirdparty() -> list[str]:
-    """内核启动时动态加载的第三方插件模块名列表。"""
+    """内核启动时动态加载的第三方插件模块名（module 显式声明，评审 P2-9）。"""
     state = _load_state()
-    return [pip.replace("-", "_") for pip, info in state["thirdparty"].items()
+    return [info.get("module") or module_of(pip)
+            for pip, info in state["thirdparty"].items()
             if isinstance(info, dict) and info.get("enabled")]
+
+
+def module_of(pip_name: str) -> str:
+    """pip 包名 → import 模块名（市场条目显式声明，不再用 replace 猜）。"""
+    entry = next((m for m in MARKET if m["pip"] == pip_name), None)
+    if entry and entry.get("module"):
+        return entry["module"]
+    return pip_name.replace("-", "_")
+
+
+def thirdparty_pips() -> set[str]:
+    """当前已安装的第三方插件 pip 名集合（面板判断 toggle 是否需要重启）。"""
+    return {pip for pip, info in _load_state()["thirdparty"].items()
+            if isinstance(info, dict)}
 
 
 def builtin_status() -> list[dict]:
@@ -126,14 +147,25 @@ def thirdparty_status() -> list[dict]:
 
 def _pip(*args: str) -> tuple[bool, str]:
     """在面板自己的 venv 里跑 pip；返回 (成败, 输出尾部)。"""
-    result = subprocess.run(
-        [sys.executable, "-m", "pip", *args, "--no-input"],
-        capture_output=True, text=True, errors="replace", timeout=300)
+    try:
+        result = subprocess.run(
+            [sys.executable, "-m", "pip", *args, "--no-input"],
+            capture_output=True, text=True, errors="replace", timeout=300)
+    except subprocess.TimeoutExpired:   # 评审 P2-7：超时要接住，不能炸面板
+        return False, "安装超时（5 分钟），可重试或换个网络"
     output = (result.stdout or "") + (result.stderr or "")
     return result.returncode == 0, output.strip()[-400:]
 
 
+_install_lock = threading.Lock()   # 评审 P2-8：装/卸串行，防并发写坏状态
+
+
 def install(pip_name: str) -> tuple[bool, str]:
+    with _install_lock:
+        return _install_locked(pip_name)
+
+
+def _install_locked(pip_name: str) -> tuple[bool, str]:
     if pip_name not in _MARKET_PIPS:
         return False, "不在精选市场白名单里，拒绝安装"
     entry = next(m for m in MARKET if m["pip"] == pip_name)
@@ -163,11 +195,17 @@ def install(pip_name: str) -> tuple[bool, str]:
     name = next((m["name"] for m in MARKET if m["pip"] == pip_name), pip_name)
     state["thirdparty"].setdefault(pip_name, {})["enabled"] = True
     state["thirdparty"][pip_name]["name"] = name
+    state["thirdparty"][pip_name]["module"] = module_of(pip_name)
     _save_state(state)
     return True, log
 
 
 def uninstall(pip_name: str) -> tuple[bool, str]:
+    with _install_lock:
+        return _uninstall_locked(pip_name)
+
+
+def _uninstall_locked(pip_name: str) -> tuple[bool, str]:
     state = _load_state()
     if pip_name not in state["thirdparty"]:
         return False, "没有安装过这个插件"

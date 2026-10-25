@@ -22,20 +22,22 @@ from nonebot.adapters.onebot.v11 import Message, MessageEvent, MessageSegment
 from nonebot.params import CommandArg
 
 from .. import douyin, plugin_manager
+from .chat import _cmd_gate
 
-cmd_watch = on_command("刷抖音", priority=4, block=True)
-cmd_stop = on_command("停止抖音", aliases={"停止刷抖音"}, priority=4, block=True)
-cmd_pause = on_command("抖音暂停", priority=4, block=True)
-cmd_resume = on_command("抖音继续", priority=4, block=True)
-cmd_next = on_command("抖音下一个", priority=4, block=True)
-cmd_like = on_command("抖音点赞", priority=4, block=True)
-cmd_follow = on_command("抖音关注", priority=4, block=True)
-cmd_comment = on_command("抖音评论", priority=4, block=True)
-cmd_search = on_command("抖音搜索", priority=4, block=True)
-cmd_shot = on_command("抖音截图", priority=4, block=True)
-cmd_dy_status = on_command("抖音状态", priority=4, block=True)
-cmd_rate = on_command("抖音点赞率", priority=4, block=True)
-cmd_help = on_command("抖音帮助", priority=4, block=True)
+cmd_watch = on_command("刷抖音", rule=_cmd_gate, priority=4, block=True)
+cmd_stop = on_command("停止抖音", aliases={"停止刷抖音"},
+                      rule=_cmd_gate, priority=4, block=True)
+cmd_pause = on_command("抖音暂停", rule=_cmd_gate, priority=4, block=True)
+cmd_resume = on_command("抖音继续", rule=_cmd_gate, priority=4, block=True)
+cmd_next = on_command("抖音下一个", rule=_cmd_gate, priority=4, block=True)
+cmd_like = on_command("抖音点赞", rule=_cmd_gate, priority=4, block=True)
+cmd_follow = on_command("抖音关注", rule=_cmd_gate, priority=4, block=True)
+cmd_comment = on_command("抖音评论", rule=_cmd_gate, priority=4, block=True)
+cmd_search = on_command("抖音搜索", rule=_cmd_gate, priority=4, block=True)
+cmd_shot = on_command("抖音截图", rule=_cmd_gate, priority=4, block=True)
+cmd_dy_status = on_command("抖音状态", rule=_cmd_gate, priority=4, block=True)
+cmd_rate = on_command("抖音点赞率", rule=_cmd_gate, priority=4, block=True)
+cmd_help = on_command("抖音帮助", rule=_cmd_gate, priority=4, block=True)
 
 
 def _admin(event: MessageEvent) -> bool:
