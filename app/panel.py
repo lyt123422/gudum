@@ -21,7 +21,8 @@ import uvicorn
 from fastapi import FastAPI, Request
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
 
-from . import jailbreak, personas, plugin_manager, proxy_manager, schedule_core
+from . import (jailbreak, personas, plugin_manager, proxy_manager,
+               schedule_core, workbuddy_setup)
 from .envutil import EnvValueError, load_env, update_env as _env_update
 from .log_setup import redact_log
 
@@ -716,17 +717,24 @@ async def api_proxy() -> dict:
     st = proxy_manager.status()
     cfg = proxy_manager.config()
     key = cfg.get("api_key") or proxy_manager.key_from_settings()
+    health = await proxy_manager.health() if st["running"] else None
+    accounts = int((health or {}).get("accounts") or 0)
+    accounts_ready = int((health or {}).get("accounts_ready") or 0)
     models: list[str] = []
-    if st["running"] and key:
+    if st["running"]:
         try:
             models = await proxy_manager.models(key)
         except Exception:
             models = []
+    install = await asyncio.to_thread(workbuddy_setup.status, cfg.get("path"))
     return {"status": st,
             "config": {"path": cfg.get("path", ""), "port": cfg.get("port", 8788),
                        "model": cfg.get("model", "")},
             "models": models,
+            "accounts": accounts,
+            "accounts_ready": accounts_ready,
             "api_key_ready": bool(key),
+            "install": install,
             "active_provider": _live_provider_name(load_env(ENV_FILE).get(
                 "DEEPSEEK_BASE_URL", ""))}
 
@@ -737,9 +745,10 @@ async def api_proxy_config(request: Request) -> dict:
     cfg = proxy_manager.config()
     path = str(body.get("path") or "").strip()
     if path:
-        if not (Path(path) / "wb_proxy.py").exists():
+        found = await asyncio.to_thread(workbuddy_setup.locate, path)
+        if not found:
             return {"ok": False, "error": f"路径下没有 wb_proxy.py: {path}"}
-        cfg["path"] = path
+        cfg["path"] = found
     port = str(body.get("port") or "").strip()
     if port:
         if not port.isdigit():
@@ -749,7 +758,25 @@ async def api_proxy_config(request: Request) -> dict:
     if api_key and not _looks_masked(api_key):
         cfg["api_key"] = api_key   # 手填优先；留空=自动读 settings.json
     proxy_manager.save_config(cfg)
-    return {"ok": True}
+    return {"ok": True, "path": cfg.get("path", ""),
+            "install": await asyncio.to_thread(
+                workbuddy_setup.status, cfg.get("path"))}
+
+
+@app.post("/api/proxy/install")
+async def api_proxy_install() -> dict:
+    """下载并安装 WorkBuddy-Hub 到 data/workbuddy-hub（已有安装直接复用）。"""
+    cfg = proxy_manager.config()
+    try:
+        info = await asyncio.to_thread(
+            workbuddy_setup.ensure_installed, cfg.get("path"))
+    except workbuddy_setup.SetupError as exc:
+        return {"ok": False, "error": str(exc),
+                "install": await asyncio.to_thread(
+                    workbuddy_setup.status, cfg.get("path"))}
+    cfg["path"] = info["path"]
+    proxy_manager.save_config(cfg)
+    return {"ok": True, **info}
 
 
 @app.post("/api/proxy/start")
@@ -757,17 +784,33 @@ async def api_proxy_start() -> dict:
     """启动反代 → 健康校验 → 自动接入（写档案+切模型源+重启内核）。"""
     ok, msg = await asyncio.to_thread(proxy_manager.start)
     if not ok:
-        return {"ok": False, "error": msg}
+        return {"ok": False, "error": msg,
+                "install": await asyncio.to_thread(
+                    workbuddy_setup.status,
+                    proxy_manager.config().get("path"))}
     cfg = proxy_manager.config()
     key = cfg.get("api_key") or proxy_manager.key_from_settings()
+    health = await proxy_manager.health()
+    accounts_ready = int((health or {}).get("accounts_ready") or 0)
+    if not accounts_ready:
+        return {"ok": True, "activated": False, "models": [],
+                "accounts_ready": 0,
+                "note": "反代已运行，但还没有可用账号：先点「🌐 登录 WorkBuddy」"
+                        "登录账号，就绪后会自动接入"}
     models: list[str] = []
     try:
         models = await proxy_manager.models(key)
     except Exception:
         models = []
-    if not key or not models:
+    if not models:
         return {"ok": True, "activated": False, "models": models,
-                "note": "反代已启动，但还没法接入：确认 Key/账号已就绪后重试"}
+                "accounts_ready": accounts_ready,
+                "note": "反代已启动，但还没法接入：确认账号已就绪后重试"}
+    # 反代列表里没有的模型名不要直接激活，否则聊天时才发现 404
+    if cfg.get("model") and cfg["model"] not in models:
+        return {"ok": True, "activated": False, "models": models,
+                "note": f"当前模型 {cfg['model']} 不在反代列表，"
+                        "请在反代页重新选择（例如 deepseek-v4.1-flash）"}
     before = load_env(ENV_FILE)
     if not cfg.get("previous"):
         cfg["previous"] = {"base_url": before.get("DEEPSEEK_BASE_URL", ""),
@@ -814,13 +857,41 @@ async def api_proxy_model(request: Request) -> dict:
     model = str(body.get("model") or "").strip()
     if not model:
         return {"ok": False, "error": "模型名不能为空"}
+    if not re.fullmatch(r"[\w.:/-]{1,80}", model):
+        return {"ok": False, "error": "模型名只能是字母/数字/-_.:/，不要带空格或换行"}
     cfg = proxy_manager.config()
+    # 反代在跑时严格校验模型 ID；防止把 deepseek4.1flash 这种不存在的写法
+    # 写进去，直到聊天才报 404。本地无 Key 且网关未开鉴权时也能查。
+    if await asyncio.to_thread(proxy_manager.is_running):
+        try:
+            available = await proxy_manager.models(
+                cfg.get("api_key") or proxy_manager.key_from_settings())
+        except Exception:
+            available = []
+        if available and model not in available:
+            sample = "、".join(available[:8])
+            return {"ok": False,
+                    "error": f"模型 {model} 不在反代 /v1/models；可用：{sample}…"}
     cfg["model"] = model
     proxy_manager.save_config(cfg)
-    restarted = False
-    if cfg.get("active"):
+    if not cfg.get("active"):
+        return {"ok": True, "restarted": False}
+    try:
         update_env({"DEEPSEEK_MODEL": model})
-        restarted = await _restart_kernel_if_running()
+    except EnvValueError as exc:
+        return {"ok": False, "error": str(exc)}
+    profiles = _load_profiles()
+    profile = profiles.get(PROXY_PROVIDER)
+    if isinstance(profile, dict):
+        profile["model"] = model
+        profiles[PROXY_PROVIDER] = profile
+        _save_profiles(profiles)
+    was_running = _running("bot") or (await asyncio.to_thread(
+        _pid_on_port, BOT_PORT)) is not None
+    restarted = await _restart_kernel_if_running() if was_running else False
+    if was_running and not restarted:
+        return {"ok": False,
+                "error": "模型已写入配置，但内核重启失败；请到运行控制手动重启"}
     return {"ok": True, "restarted": restarted}
 
 

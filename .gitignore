@@ -1,12 +1,15 @@
 .venv/
 data/
 napcat/
+vendor/
 .env
 __pycache__/
 *.pyc
 .pytest_cache/
 .ruff_cache/
 tests/__pycache__/
+dist/
+build/
 
 # 内部开发文档（不公开）
 HANDOFF.md

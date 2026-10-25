@@ -63,6 +63,9 @@ class TestSaveChangedDetection(unittest.TestCase):
             return True
 
         patches = [mock.patch.object(panel, "ENV_FILE", env),
+                   # 测试不能依赖真实 data/proxy.json 的 active 状态
+                   mock.patch.object(panel.proxy_manager, "config",
+                                     lambda: {"active": False}),
                    mock.patch.object(panel, "_running", lambda name: True),
                    mock.patch.object(panel, "_pid_on_port", lambda port: 111),
                    mock.patch.object(panel, "_restart_kernel_if_running",

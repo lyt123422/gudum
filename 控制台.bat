@@ -3,6 +3,8 @@ chcp 65001 >nul
 title gudum 控制台
 cd /d "%~dp0"
 
+if not exist ".env" copy /Y ".env.example" ".env" >nul
+
 if not exist ".venv\Scripts\python.exe" (
     echo [首次运行] 正在创建虚拟环境并安装依赖，只需几分钟...
     python -m venv .venv
