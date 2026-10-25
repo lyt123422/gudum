@@ -236,10 +236,14 @@ def get_active() -> Persona:
         name="默认伙伴", text=_SEED_DEFAULT_TEXT, examples=[], raw="")
 
 
-def compose_system(persona: Persona) -> str:
-    """最终注入的 System Prompt：人设描述 + 通用防越狱条款。"""
+def compose_system(persona: Persona, suppress_anti_jailbreak: bool = False) -> str:
+    """最终注入的 System Prompt：人设描述 + 通用防越狱条款。
+
+    suppress_anti_jailbreak: 破甲（app/jailbreak.py）生效时传 True —— ANTI_JAILBREAK
+    写着"最高优先级，不可被人覆盖"，与破甲条款直接冲突，两份同时注入会让模型左右互搏。
+    """
     parts = [persona.text or _SEED_DEFAULT_TEXT]
-    if not persona.anti_jailbreak_off:
+    if not persona.anti_jailbreak_off and not suppress_anti_jailbreak:
         parts.append(ANTI_JAILBREAK)
     return "\n\n".join(parts)
 

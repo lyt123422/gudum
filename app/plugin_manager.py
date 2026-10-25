@@ -29,6 +29,9 @@ BUILTIN: list[dict] = [
     {"id": "douyin", "name": "抖音真机",
      "desc": "QQ 遥控安卓手机真刷抖音（真滑动真声音），AI 看屏幕做决策；"
              "需在市场安装依赖并 USB 连接手机", "default": False},
+    {"id": "jailbreak", "name": "破甲（回答尺度）", "hidden": True,
+     "desc": "独立分类：直接回答、不说教、不附免责声明；"
+             "红线为破解付费软件与危害型木马。可预设、可暂停", "default": True},
     {"id": "schedule", "name": "定时任务",
      "desc": "面板配 cron + 消息内容，机器人到点自动往指定群/好友发（管理员）",
      "default": True},
@@ -136,7 +139,9 @@ def thirdparty_pips() -> set[str]:
 
 
 def builtin_status() -> list[dict]:
-    return [{**item, "enabled": is_enabled(item["id"])} for item in BUILTIN]
+    """面板「🧩 插件」列表；hidden 的条目（破甲）在独立分类页管理，不在这里重复出现。"""
+    return [{**item, "enabled": is_enabled(item["id"])}
+            for item in BUILTIN if not item.get("hidden")]
 
 
 def thirdparty_status() -> list[dict]:

@@ -109,6 +109,7 @@ pre{background:#0f172a;color:#bbf7d0;font-size:12px;padding:14px;border-radius:1
  <div class="nav" data-p="model" onclick="nav('model')">🧠 模型配置</div>
  <div class="nav" data-p="persona" onclick="nav('persona')">🎭 人设管理</div>
  <div class="nav" data-p="plugin" onclick="nav('plugin')">🧩 插件</div>
+ <div class="nav" data-p="jailbreak" onclick="nav('jailbreak')">🗡 破甲</div>
  <div class="nav" data-p="sched" onclick="nav('sched')">⏰ 定时任务</div>
  <div class="nav" data-p="run" onclick="nav('run')">🚀 运行控制</div>
  <div class="nav" data-p="log" onclick="nav('log')">📜 运行日志</div>
@@ -228,6 +229,61 @@ pre{background:#0f172a;color:#bbf7d0;font-size:12px;padding:14px;border-radius:1
   <div class="card">
    <h3>📦 已安装的第三方插件</h3>
    <div id="pl-installed">加载中…</div>
+  </div>
+ </div>
+
+ <!-- 破甲（独立分类） -->
+ <div class="page" id="pg-jailbreak">
+  <div class="card">
+   <h3>🗡 破甲 · 回答尺度</h3>
+   <div class="desc">破甲不是插件，是独立功能分类：在 System Prompt 层追加回答尺度条款，
+    <b>人设性格完整保留</b>，只是不再说教、不再附免责声明、不把技术问题降级成概念讲解。</div>
+   <div class="row" style="align-items:center;gap:12px;margin-top:4px">
+    <span class="chip" id="jb-badge"><span class="dot"></span>加载中</span>
+    <button class="green" id="jb-start" onclick="jbStart()">▶ 启动破甲</button>
+    <button class="red" id="jb-stop" onclick="jbStop()">⏹ 结束破甲</button>
+    <button class="ghost" id="jb-pause" onclick="jbPauseToggle()">⏸ 暂停</button>
+   </div>
+   <div class="msg" id="jb-msg"></div>
+   <div class="desc" id="jb-state" style="margin-top:8px">加载中…</div>
+  </div>
+
+  <div class="card">
+   <h3>🎚 预设（只影响尺度与口吻）</h3>
+   <div class="desc">三种预设共用同一套硬红线，切换立即生效，不用重启。</div>
+   <div class="row" style="gap:8px">
+    <select id="jb-preset" style="max-width:320px"></select>
+    <button class="ghost" onclick="jbApplyPreset()">应用预设</button>
+   </div>
+   <div class="desc" id="jb-preset-desc" style="margin-top:8px"></div>
+  </div>
+
+  <div class="card">
+   <h3>⛔ 硬红线（不可覆盖）</h3>
+   <div class="tip" style="background:#fef2f2;border:1px solid #fecaca;color:#991b1b;
+        padding:12px 14px;border-radius:10px;font-size:12.5px;line-height:1.9">
+    ① 不协助破解、去授权、绕过任何软件的付费与授权机制：卡密、激活码、注册机、试用期绕过、license check patch、伪造激活。<br>
+    ② 不编写、不改写、不分发危害型恶意程序：病毒、蠕虫、勒索软件、远控木马、窃密工具、面向真实破坏的载荷。<br>
+    <b>其余话题按上面的尺度正常回答，不再额外设限。</b>
+   </div>
+   <div class="desc" style="margin-top:10px">红线段写死在 <code>app/jailbreak.py</code> 的 <code>_REDLINES</code> 常量里，
+    预设改不动、对话也取消不掉。要改只能改代码。</div>
+  </div>
+
+  <div class="card">
+   <h3>🔍 自检（改了不生效时点这里）</h3>
+   <div class="desc">检查三件事：条款能不能拼出来、当前状态是否真的生效、内核进程里加载的是不是新代码。</div>
+   <div class="row"><button class="ghost" onclick="jbSelftest()">运行自检</button></div>
+   <pre id="jb-selftest" style="display:none;margin-top:12px"></pre>
+  </div>
+
+  <div class="card">
+   <h3>💬 QQ 里的指令（管理员）</h3>
+   <div class="desc">
+    <code>破甲状态</code> · <code>破甲开</code> · <code>破甲关</code> ·
+    <code>破甲暂停</code> · <code>破甲继续</code> · <code>破甲预设 技术直答</code><br>
+    群聊需 @机器人 或 / 前缀。默认为<b>仅管理员</b>生效，路人走普通人设。
+   </div>
   </div>
  </div>
 
@@ -365,7 +421,7 @@ let PRESETS={},PROFILES={},curProv='',liveProv='';
 
 /* ---------- 导航 ---------- */
 const TITLES={home:'总览',model:'模型配置',persona:'人设管理',plugin:'插件',
- sched:'定时任务',run:'运行控制',log:'运行日志',guide:'使用教程'};
+ jailbreak:'破甲',sched:'定时任务',run:'运行控制',log:'运行日志',guide:'使用教程'};
 function nav(p){document.querySelectorAll('.nav').forEach(e=>e.classList.toggle('on',e.dataset.p===p));
  document.querySelectorAll('.page').forEach(e=>e.classList.toggle('on',e.id==='pg-'+p));
  $('page-title').textContent=TITLES[p]}
@@ -584,6 +640,53 @@ async function adoptQq(){
  msg('qq-msg',j.ok?('✅ 已把配置账号采用为 '+j.qq):'❌ '+(j.error||'失败'),j.ok?'ok':'err');
  if(j.ok){$('f-account').value=j.qq;refresh()}}
 
+/* ---------- 破甲（独立分类） ---------- */
+let JB={enabled:false,paused:false,active:false,preset:'',presets:[]};
+async function loadJailbreak(){
+ try{JB=await(await fetch('/api/jailbreak')).json();renderJailbreak()}catch(e){}}
+function renderJailbreak(){
+ const sel=$('jb-preset');
+ sel.innerHTML='';
+ JB.presets.forEach(p=>{const o=document.createElement('option');o.value=p.id;
+  o.textContent=p.name+' · '+p.desc;sel.append(o)});
+ sel.value=JB.preset;
+ const cur=JB.presets.find(p=>p.id===JB.preset);
+ $('jb-preset-desc').textContent=cur?('当前：'+cur.name+' —— '+cur.desc):'';
+ // 状态徽章
+ const badge=$('jb-badge');
+ badge.className='chip';
+ if(!JB.enabled){badge.innerHTML='<span class="dot"></span>已关闭 · 走普通人设'}
+ else if(JB.paused){badge.innerHTML='<span class="dot"></span>已暂停 · 恢复普通人设'}
+ else{badge.className='chip on';badge.innerHTML='<span class="dot"></span>生效中'}
+ // 按钮可用性：互斥，避免点了没反应
+ $('jb-start').disabled=JB.enabled&&!JB.paused;
+ $('jb-stop').disabled=!JB.enabled;
+ $('jb-pause').textContent=JB.paused?'▶ 继续':'⏸ 暂停';
+ $('jb-pause').disabled=!JB.enabled;
+ $('jb-state').textContent=
+  '· 插件开关：'+(JB.enabled?'开':'关')+
+  '　暂停：'+(JB.paused?'是':'否')+
+  '　实际生效：'+(JB.active?'是':'否')+'\n'+
+  '· 生效范围：仅管理员（.env 的 JAILBREAK_SCOPE=all 可改为所有人）\n'+
+  '· 触发条件：管理员发消息时自动注入条款，无需每次下指令';
+ $('jb-state').style.whiteSpace='pre-line';}
+async function jbPost(body){
+ const j=await(await fetch('/api/jailbreak/set',{method:'POST',
+  headers:{'Content-Type':'application/json'},body:JSON.stringify(body)})).json();
+ if(j.ok){JB=Object.assign(JB,j);renderJailbreak();
+  msg('jb-msg','✅ 已生效（无需重启内核）','ok')}
+ else msg('jb-msg','❌ '+(j.error||'失败'),'err');
+ setTimeout(()=>{$('jb-msg').textContent=''},4000);return j}
+async function jbStart(){await jbPost({enabled:true,paused:false})}
+async function jbStop(){await jbPost({enabled:false})}
+async function jbPauseToggle(){await jbPost({paused:!JB.paused})}
+async function jbApplyPreset(){await jbPost({preset:$('jb-preset').value})}
+async function jbSelftest(){
+ const box=$('jb-selftest');box.style.display='block';box.textContent='自检中…';
+ try{const j=await(await fetch('/api/jailbreak/selftest')).json();
+  box.textContent=(j.ok?'✅ 自检通过\n\n':'❌ 发现问题\n\n')+j.report}
+ catch(e){box.textContent='❌ 自检接口调用失败：'+e}}
+
 /* ---------- 插件中心 ---------- */
 let PL={builtin:[],market:[],installed:[]};
 async function loadPlugins(){
@@ -681,10 +784,12 @@ function schedEdit(t){   // 填回表单，改完点保存即覆盖同名任务
  msg('sc-msg','✏️ 已填入「'+t.name+'」，改完点 💾 保存','')}
 async function schedSave(){
  const body={name:$('sc-name').value.trim(),cron:$('sc-cron').value.trim(),
-  content:$('sc-content').value.trim(),target:$('sc-target').value.trim(),
-  enabled:true};
+  content:$('sc-content').value.trim(),target:$('sc-target').value.trim()};
  if(!body.name||!body.cron||!body.content||!body.target){
   msg('sc-msg','❌ 名字 / cron / 内容 / 目标 都要填','err');return}
+ // 编辑已有任务时保留原启用状态；新建默认开启（要关去列表点开关）
+ const existing=SC.tasks.find(t=>t.name===body.name);
+ body.enabled=existing?!!existing.enabled:true;
  let type='group';
  if(body.target.toLowerCase().startsWith('friend:')){type='private';body.target=body.target.slice(7).trim()}
  body.type=type;
@@ -708,7 +813,7 @@ async function schedToggle(name,en){
  if(j.tasks)SC.tasks=j.tasks;
  renderSched()}
 
-loadProviders().then(()=>loadCfg(true));loadPersonas();loadPlugins();
+loadProviders().then(()=>loadCfg(true));loadPersonas();loadPlugins();loadJailbreak();
 loadSched();refresh();loadLogs();
 setInterval(refresh,3000);setInterval(loadLogs,5000);setInterval(pollPersonaName,15000);
 </script><div id="toast"></div>

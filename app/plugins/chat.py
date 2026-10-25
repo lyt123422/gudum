@@ -32,7 +32,7 @@ from nonebot.exception import FinishedException
 from nonebot.params import CommandArg
 from nonebot.rule import Rule
 
-from .. import assistant_state, personas, plugin_manager, tts, vision, web_search
+from .. import assistant_state, jailbreak, personas, plugin_manager, tts, vision, web_search
 from ..deepseek_api import DeepSeekClient, DeepSeekError
 from ..envutil import ENV_FILE, ROOT, update_env
 from ..log_setup import redact_log
@@ -51,6 +51,9 @@ client = DeepSeekClient(
     api_key=_cfg("DEEPSEEK_API_KEY", ""),
     model=_cfg("DEEPSEEK_MODEL", "deepseek-chat"),
     timeout=float(_cfg("DEEPSEEK_TIMEOUT", "60")),
+    # 推理模型（*-flash-high / reasoner）的思考 token 算进这个预算：
+    # 2048 会在长思考时把正文挤成空字符串（实测 gemini-test-flash 约 1/3 概率）
+    max_tokens=int(_cfg("CHAT_MAX_TOKENS", "4096")),
 )
 
 MEMORY_HOURS = float(_cfg("MEMORY_HOURS", "2"))
@@ -71,6 +74,9 @@ TTS_VOICE = _cfg("TTS_VOICE", "zh-CN-XiaoxiaoNeural")
 # 用多模态模型时设 VISION_ENABLED=true，图片默认在本机下载转 base64 上传
 VISION_ENABLED = _cfg("VISION_ENABLED", "false").lower() in ("true", "1", "yes")
 VISION_INPUT_MODE = _cfg("VISION_INPUT_MODE", "base64")   # base64 | url
+
+# 破甲（回答尺度）：admin=只对管理员生效（默认，群里路人拿不到无限制回答）；all=所有人
+JAILBREAK_SCOPE = _cfg("JAILBREAK_SCOPE", "admin").lower()
 
 # 时效性问题自动联网的意图词（也可用「联网 <问题>」强制触发）
 _NEEDS_WEB_RE = re.compile(
@@ -417,6 +423,16 @@ cmd_voice_off = on_command("语音关", aliases={"关闭语音"},
                            rule=_cmd_gate, priority=5, block=True)
 cmd_persona = on_command("人设", rule=_cmd_gate, priority=5, block=True)
 cmd_status = on_command("状态", aliases={"status"}, rule=_cmd_gate, priority=5, block=True)
+# 破甲优先级 4：比「状态」高，避免被同前缀指令抢匹配
+cmd_jb_on = on_command("破甲开", aliases={"开启破甲"},
+                       rule=_cmd_gate, priority=4, block=True)
+cmd_jb_off = on_command("破甲关", aliases={"关闭破甲"},
+                        rule=_cmd_gate, priority=4, block=True)
+cmd_jb_pause = on_command("破甲暂停", rule=_cmd_gate, priority=4, block=True)
+cmd_jb_resume = on_command("破甲继续", aliases={"破甲恢复"},
+                           rule=_cmd_gate, priority=4, block=True)
+cmd_jb_preset = on_command("破甲预设", rule=_cmd_gate, priority=4, block=True)
+cmd_jb_status = on_command("破甲状态", rule=_cmd_gate, priority=4, block=True)
 
 msg_group = on_message(rule=Rule(_group_at_me), priority=10, block=True)
 msg_private = on_message(rule=Rule(_is_private), priority=50, block=True)
@@ -512,7 +528,13 @@ async def _do_chat(matcher, event: MessageEvent, q: str,
                             f"你按角色习惯称呼为「{active.address}」。")
         else:
             address_line = ""
-        system_prompt = personas.compose_system(active)
+        # 破甲（回答尺度）：生效时注入条款，并抑制人设的 ANTI_JAILBREAK 避免左右互搏
+        jb_active = jailbreak.is_active() and (
+            JAILBREAK_SCOPE != "admin" or _is_admin(event.user_id))
+        system_prompt = personas.compose_system(
+            active, suppress_anti_jailbreak=jb_active)
+        if jb_active:
+            system_prompt += "\n\n" + jailbreak.render_clause()
         if address_line:
             system_prompt += "\n\n" + address_line
         # 联网搜索：显式「联网」或命中时效性意图词；插件开关在面板「🧩 插件」里
@@ -830,6 +852,86 @@ async def _(matcher, event: MessageEvent):
         f"· 限频: {HOURLY_LIMIT} 次/人/小时，群冷却 {GROUP_MIN_INTERVAL:g} 秒",
         "· 本机自检: http://127.0.0.1:" + _cfg("PORT", "8081") + "/healthz",
     ]))
+
+
+# ---------- 破甲（回答尺度）指令：管理员专用，与「切换人设」权限对齐 ----------
+
+def _jb_admin_guard(matcher, event: MessageEvent) -> bool:
+    if not _is_admin(event.user_id):
+        return False
+    return True
+
+
+def _jb_status_line() -> str:
+    st = jailbreak.status()
+    scope = "仅管理员" if JAILBREAK_SCOPE == "admin" else "所有人"
+    if not st["enabled"]:
+        state = "已关闭"
+    elif st["paused"]:
+        state = "已暂停（手动恢复）"
+    else:
+        state = "生效中"
+    return (f"· 开关: {'开' if st['enabled'] else '关'}　状态: {state}\n"
+            f"· 预设: {st['preset']}　生效范围: {scope}")
+
+
+@cmd_jb_status.handle()
+async def _(matcher, event: MessageEvent):
+    if not _jb_admin_guard(matcher, event):
+        return   # 非管理员静默，与「状态」一致，不暴露配置
+    await matcher.finish("\n".join([
+        "🗡 破甲状态",
+        _jb_status_line(),
+        "· 预设可选: " + "、".join(jailbreak.PRESETS),
+        "· 红线: 破解付费/授权机制、危害型恶意程序（不可覆盖）",
+    ]))
+
+
+@cmd_jb_on.handle()
+async def _(matcher, event: MessageEvent):
+    if not _jb_admin_guard(matcher, event):
+        return
+    jailbreak.set_enabled(True)
+    await matcher.finish("🗡 破甲已开启\n" + _jb_status_line())
+
+
+@cmd_jb_off.handle()
+async def _(matcher, event: MessageEvent):
+    if not _jb_admin_guard(matcher, event):
+        return
+    jailbreak.set_enabled(False)
+    await matcher.finish("🗡 破甲已关闭，恢复普通人设\n" + _jb_status_line())
+
+
+@cmd_jb_pause.handle()
+async def _(matcher, event: MessageEvent):
+    if not _jb_admin_guard(matcher, event):
+        return
+    jailbreak.set_paused(True)
+    await matcher.finish("⏸ 破甲已暂停（重启仍保持暂停，发「破甲继续」恢复）\n"
+                         + _jb_status_line())
+
+
+@cmd_jb_resume.handle()
+async def _(matcher, event: MessageEvent):
+    if not _jb_admin_guard(matcher, event):
+        return
+    jailbreak.set_paused(False)
+    await matcher.finish("▶️ 破甲已恢复\n" + _jb_status_line())
+
+
+@cmd_jb_preset.handle()
+async def _(matcher, event: MessageEvent, args: Message = CommandArg()):  # noqa: B008
+    if not _jb_admin_guard(matcher, event):
+        return
+    name = args.extract_plain_text().strip()
+    if not name:
+        await matcher.finish("用法：破甲预设 <名称>\n可选："
+                             + "、".join(f"{k}（{v['desc']}）"
+                                        for k, v in jailbreak.PRESETS.items()))
+    if not jailbreak.set_preset(name):
+        await matcher.finish("没有这个预设，可选：" + "、".join(jailbreak.PRESETS))
+    await matcher.finish(f"✅ 破甲预设已切为「{name}」\n" + _jb_status_line())
 
 
 @msg_private.handle()

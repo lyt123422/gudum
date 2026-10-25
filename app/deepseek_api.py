@@ -17,12 +17,22 @@ class DeepSeekError(Exception):
         self.raw_detail = raw_detail
 
 
+def _reasoning_tokens(resp) -> int:
+    """取推理 token 数；服务商没暴露该字段时返回 0（不影响主流程）。"""
+    try:
+        details = resp.usage.completion_tokens_details
+        return int(getattr(details, "reasoning_tokens", 0) or 0)
+    except Exception:  # noqa: BLE001
+        return 0
+
+
 class DeepSeekClient:
     def __init__(self, base_url: str, api_key: str, model: str,
                  timeout: float = 60.0, max_retries: int = 2,
-                 temperature: float = 0.8):
+                 temperature: float = 0.8, max_tokens: int = 4096):
         self.model = model
         self.temperature = temperature
+        self.max_tokens = max_tokens
         self.base_url = base_url or "https://api.deepseek.com"
         # 空 Key 时填占位值：让请求走出去拿 401，错误信息比构造时报错更友好
         self._client = openai.AsyncOpenAI(
@@ -36,17 +46,27 @@ class DeepSeekClient:
         """释放连接池（评审 v3 P1-5：每次决策新建的客户端必须关，否则泄漏）。"""
         await self._client.close()
 
+    async def _create(self, messages: list[dict], temperature: float | None,
+                      max_tokens: int):
+        return await self._client.chat.completions.create(
+            model=self.model,
+            messages=messages,  # type: ignore[arg-type]
+            max_tokens=max_tokens,
+            temperature=self.temperature if temperature is None else temperature,
+            stream=False,
+        )
+
     async def chat(self, messages: list[dict],
                    temperature: float | None = None) -> str:
-        """messages: [{"role": "system"|"user"|"assistant", "content": str|list}]"""
+        """messages: [{"role": "system"|"user"|"assistant", "content": str|list}]
+
+        推理模型（gemini-3.x-flash-high、deepseek-reasoner 等）会把思考 token 算进
+        max_tokens：思考吃满时正文为空、finish_reason=length。这种情况不是模型拒答，
+        是预算不够——放宽一档重试一次，仍空才报错。
+        """
+        budget = self.max_tokens
         try:
-            resp = await self._client.chat.completions.create(
-                model=self.model,
-                messages=messages,  # type: ignore[arg-type]
-                max_tokens=2048,
-                temperature=self.temperature if temperature is None else temperature,
-                stream=False,
-            )
+            resp = await self._create(messages, temperature, budget)
         except openai.AuthenticationError as exc:
             raise DeepSeekError(
                 "API Key 无效：请检查 .env 里的 DEEPSEEK_API_KEY 是否填对",
@@ -75,12 +95,23 @@ class DeepSeekClient:
                     str(exc)) from exc
             raise DeepSeekError(
                 f"DeepSeek 返回错误（HTTP {exc.status_code}）", str(exc)[:300]) from exc
-        except Exception as exc:  # noqa: BLE001
+        except Exception as exc:
             raise DeepSeekError("AI 服务出了点小问题，请稍后再试", str(exc)[:300]) from exc
 
-        if not resp.choices:
-            raise DeepSeekError("AI 没有返回内容，请换个问法试试")
-        text = (resp.choices[0].message.content or "").strip()
+        text = (resp.choices[0].message.content or "").strip() if resp.choices else ""
+        if not text:
+            # 空正文 + 思考吃满预算 → 翻倍重试一次（只重试这一种，别把真拒答也重试）
+            tight = (not resp.choices
+                     or resp.choices[0].finish_reason == "length"
+                     or bool(_reasoning_tokens(resp)))
+            if tight:
+                try:
+                    resp = await self._create(messages, temperature, min(budget * 4, 16384))
+                    text = (resp.choices[0].message.content or "").strip() \
+                        if resp.choices else ""
+                except Exception as exc:
+                    raise DeepSeekError(
+                        "AI 服务出了点小问题，请稍后再试", str(exc)[:300]) from exc
         if not text:
             raise DeepSeekError("AI 没有返回内容，请换个问法试试")
         return text
