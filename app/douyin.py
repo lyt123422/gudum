@@ -37,10 +37,13 @@ MAX_DAILY_MIN = 120
 
 _state: dict = {"device": None, "dev_lock": threading.Lock(),
                 "connect_lock": threading.Lock(),
+                "start_lock": threading.Lock(),
                 "thread": None, "stop": threading.Event(),
                 "pause": threading.Event(), "started_at": 0.0,
                 "plan_min": 0, "last_active": 0.0,
                 "ai_failures": 0, "gen": 0, "last_error": "", "watchdog": None}
+
+_drift_warned: dict = {"key": ""}   # 评审 v4 P2-7：模型漂移告警去重
 
 
 # ---------- adb / 设备 ----------
@@ -265,13 +268,20 @@ def _ai_client():
 
 
 def _warn_model_drift(base_url: str, model: str) -> None:
-    """抖音决策与聊天共用的模型配置漂移时告警（任务书 3.4）。"""
+    """抖音决策与聊天共用的模型配置漂移时告警；同一组合只告警一次（评审 v4 P2-7）。"""
+    key = base_url.rstrip("/") + "|" + model
     try:
         from .plugins import chat as _chat   # noqa: PLC0415
         chat_base = str(getattr(_chat.client, "base_url", "")).rstrip("/")
+        chat_model = _chat.client.model
         if _chat.client.model != model or chat_base != base_url.rstrip("/"):
+            if _drift_warned["key"] == key:
+                return
+            _drift_warned["key"] = key
             logger.warning("抖音决策模型与聊天模型不一致：chat={}/{} douyin={}/{}",
-                           chat_base, _chat.client.model, base_url, model)
+                           chat_base, chat_model, base_url, model)
+        else:
+            _drift_warned["key"] = ""   # 恢复一致后允许未来再次告警
     except Exception:
         pass
 
@@ -445,17 +455,15 @@ def _device_alive(dev) -> bool:
         return False
 
 
-def _ensure_foreground(dev) -> bool:
-    """亮屏+解锁+确认在抖音前台；亮屏但停在锁屏的情况也会处理。"""
+def _ensure_awake(dev) -> bool:
+    """只负责亮屏+解锁（评审 v4 P1-1：不判断是否在抖音，打开抖音是主循环的事）。"""
     for _ in range(2):
         try:
             dev.screen_on()
             dev.unlock()
-            if _in_douyin(dev):
-                return True
+            return True
         except Exception:
             return False
-        time.sleep(1)
     return False
 
 
@@ -502,12 +510,16 @@ def _ai_session_loop(minutes: int, gen: int) -> None:
                     _state["device"] = None
                 break
             try:
-                if not _ensure_foreground(dev):
+                if not _ensure_awake(dev):
                     _state["last_error"] = "手机锁屏/未解锁，请解锁后重试"
                     logger.warning("{}", _state["last_error"])
                     break
                 if not _in_douyin(dev):
-                    _open_douyin(dev)
+                    _open_douyin(dev)   # 评审 v4 P1-1：停在桌面也能帮你打开抖音
+                    if not _in_douyin(dev):
+                        _state["last_error"] = "没能打开抖音，请手动打开后重试"
+                        logger.warning("{}", _state["last_error"])
+                        break
                 shot1 = _frame(dev)
             except Exception as exc:   # noqa: BLE001
                 _state["last_error"] = f"手机不可用: {str(exc)[:150]}"
@@ -543,6 +555,12 @@ def _ai_session_loop(minutes: int, gen: int) -> None:
                 _pause_aware_sleep(random.uniform(3, 6))
                 continue
             # 决策花了最长 25 秒：期间 stop/新会话可能已发生，动作必须作废
+            if stop.is_set() or gen != _state["gen"]:
+                return
+            # 评审 v4 P2-2：决策的 25 秒里用户可能按了暂停——恢复前不执行动作
+            while _state["pause"].is_set() and not stop.is_set() \
+                    and gen == _state["gen"]:
+                time.sleep(0.5)
             if stop.is_set() or gen != _state["gen"]:
                 return
             logger.info("🤖 AI 刷抖音(真机): {} ({})", d["action"], d["reason"])
@@ -587,43 +605,51 @@ def _start_watchdog() -> None:
 # ---------- 对外操作 ----------
 
 def start(minutes: int) -> tuple[bool, str]:
-    with _state["dev_lock"]:
-        if _state["thread"] and not _state["thread"].is_alive():
-            _state["thread"] = None
+    # 评审 v4 P2-1：全程持 start_lock——并发「刷抖音」只有一路能开会话
+    with _state["start_lock"]:
+        with _state["dev_lock"]:
+            if _state["thread"] and not _state["thread"].is_alive():
+                _state["thread"] = None
+            if _alive():
+                return False, "已经在刷了，发「抖音暂停」或「停止抖音」"
+        minutes = max(1, min(minutes, MAX_SESSION_MIN))
+        if _daily_minutes() + minutes > MAX_DAILY_MIN:
+            left = max(0, MAX_DAILY_MIN - _daily_minutes())
+            return False, f"今日上限 {MAX_DAILY_MIN} 分钟，还剩 {left} 分钟"
+        # 评审 v3 P1-5：启动前做真配置检查
+        from .envutil import ENV_FILE, load_env
+        env = load_env(ENV_FILE)
+        if not (env.get("DEEPSEEK_API_KEY") or "").strip():
+            return False, "还没填 API Key：控制台 → 模型配置"
+        if not (env.get("DEEPSEEK_MODEL") or "").strip():
+            return False, "还没设置模型：控制台 → 模型配置"
+        gen_before = _state["gen"]
+        ok, msg = connect()
+        if not ok:
+            return False, msg
+        if _state["gen"] != gen_before:
+            # connect 耗时期间用户按了停止：尊重它，不要 clear 掉（评审 v4 P2-1）
+            return False, "连接期间收到停止指令，已取消本次开刷"
         if _alive():
             return False, "已经在刷了，发「抖音暂停」或「停止抖音」"
-    minutes = max(1, min(minutes, MAX_SESSION_MIN))
-    if _daily_minutes() + minutes > MAX_DAILY_MIN:
-        left = max(0, MAX_DAILY_MIN - _daily_minutes())
-        return False, f"今日上限 {MAX_DAILY_MIN} 分钟，还剩 {left} 分钟"
-    # 评审 v3 P1-5：启动前做真配置检查（原来的 _ai_client() 空建客户端是假验证）
-    from .envutil import ENV_FILE, load_env
-    env = load_env(ENV_FILE)
-    if not (env.get("DEEPSEEK_API_KEY") or "").strip():
-        return False, "还没填 API Key：控制台 → 模型配置"
-    if not (env.get("DEEPSEEK_MODEL") or "").strip():
-        return False, "还没设置模型：控制台 → 模型配置"
-    ok, msg = connect()
-    if not ok:
-        return False, msg
-    _state["stop"].clear()
-    _state["pause"].clear()
-    _state["started_at"] = time.time()
-    _state["plan_min"] = minutes
-    _state["last_error"] = ""
-    _state["ai_failures"] = 0
-    _state["gen"] = _state["gen"] + 1   # 新会话作废一切旧循环（评审 v3 P1-3）
-    _recent.clear()                     # 评审 v3 P2-15：决策记录不跨会话
-    _state["last_rest"] = time.time()   # 评审 v3 P3：休息计时随会话重置
-    assistant_state.session_started(minutes)   # 共享状态：聊天 AI 的自我认知
-    _state["thread"] = threading.Thread(target=_ai_session_loop,
-                                        args=(minutes, _state["gen"]),
-                                        daemon=True)
-    _state["thread"].start()
-    _start_watchdog()
-    _touch()
-    return True, (f"🤖 AI 真机刷抖音开刷（约 {minutes} 分钟）：手机上真开抖音"
-                  "（有声音），AI 看真实屏幕两帧做决策。手机保持解锁+亮屏+USB 连接")
+        _state["stop"].clear()
+        _state["pause"].clear()
+        _state["started_at"] = time.time()
+        _state["plan_min"] = minutes
+        _state["last_error"] = ""
+        _state["ai_failures"] = 0
+        _state["gen"] = _state["gen"] + 1   # 新会话作废一切旧循环（评审 v3 P1-3）
+        _recent.clear()                     # 评审 v3 P2-15：决策记录不跨会话
+        _state["last_rest"] = time.time()   # 评审 v3 P3：休息计时随会话重置
+        assistant_state.session_started(minutes)   # 共享状态：聊天 AI 的自我认知
+        _state["thread"] = threading.Thread(target=_ai_session_loop,
+                                            args=(minutes, _state["gen"]),
+                                            daemon=True)
+        _state["thread"].start()
+        _start_watchdog()
+        _touch()
+        return True, (f"🤖 AI 真机刷抖音开刷（约 {minutes} 分钟）：手机上真开抖音"
+                      "（有声音），AI 看真实屏幕两帧做决策。手机保持解锁+亮屏+USB 连接")
 
 
 def stop() -> tuple[bool, str]:

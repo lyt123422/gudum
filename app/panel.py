@@ -224,6 +224,8 @@ def _llm_test(base: str, key: str, model: str) -> dict:
             return {"ok": False, "error": "请求超时（服务无响应）"}
         return {"ok": False,
                 "error": "调用失败（网络或服务错误），详情已写服务端日志"}
+    if not resp.choices:
+        return {"ok": False, "error": "服务返回了空响应（模型名可能不对）"}   # 评审 v4 P2-9
     return {"ok": True, "latency_ms": int((time.time() - start) * 1000),
             "reply": (resp.choices[0].message.content or "").strip()}
 
@@ -312,12 +314,18 @@ async def api_save(request: Request) -> dict:
         if requested_base != old_base and not values.get("DEEPSEEK_API_KEY"):
             return {"ok": False, "error": "更换 Base URL 时必须同时填写 API Key"}
         old_key = str(old_profile.get("api_key", ""))
-        if old_key and _looks_masked(old_key):
+        had_masked = bool(old_key and _looks_masked(old_key))
+        if had_masked:
             old_key = ""   # 评审 v3 P2-7：历史掩码 Key 不可复用
         if not values.get("DEEPSEEK_API_KEY") and requested_base == old_base \
                 and not old_key and not base_url.startswith(("http://127.0.0.1",
                                                              "http://localhost")):
-            return {"ok": False, "error": "该档案保存的是掩码 Key，请重新输入完整 Key"}
+            # 评审 v4 P2-10：区分"没 Key"和"掩码 Key"
+            if had_masked:
+                return {"ok": False,
+                        "error": "该档案保存的是掩码 Key，请重新输入完整 Key"}
+            return {"ok": False,
+                    "error": "该提供商还没有可用的 API Key，请先填写"}
         new_key = values.get("DEEPSEEK_API_KEY") or \
             (old_key if requested_base == old_base else "")
         new_model = values.get("DEEPSEEK_MODEL") or old_profile.get("model", "")
@@ -481,8 +489,11 @@ def _kernel_identity_ok(pid: int) -> bool:
 _restart_lock = asyncio.Lock()   # 评审 v3 P2-10：重启串行，防并发双启
 
 
+RESTART_POLL_INTERVAL = 0.5   # 端口/健康检查轮询间隔（测试可 patch 此常量提速）
+
+
 async def _restart_poll_delay() -> None:
-    await _restart_poll_delay()   # 测试可 patch 本函数跳过真实等待
+    await asyncio.sleep(RESTART_POLL_INTERVAL)
 
 
 async def _restart_kernel_if_running() -> bool:

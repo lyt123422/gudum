@@ -43,6 +43,7 @@ async def fetch_data_url(url: str) -> str:
     评审 v3 P2-4：不自动跟随重定向——手动最多 3 跳，每一跳都复查域名白名单，
     防止 QQ 图 302 到任意域名；流式读取，超 6MB 中途终止。
     """
+    from urllib.parse import urljoin
     if not url.lower().startswith(("http://", "https://")):
         raise ValueError("图片地址不合法")
     current = url
@@ -53,22 +54,26 @@ async def fetch_data_url(url: str) -> str:
         for _ in range(3):
             if not host_allowed(current):
                 raise ValueError("图片域名不在 QQ 多媒体白名单")
-            resp = await client.get(current)
-            if resp.status_code in (301, 302, 303, 307, 308):
-                current = resp.headers.get("location", "")
-                if not current:
-                    raise ValueError("图片重定向失败")
-                continue
-            resp.raise_for_status()
-            size = 0
-            chunks = []
-            async for chunk in resp.aiter_bytes():
-                size += len(chunk)
-                if size > _MAX_BYTES:
-                    raise ValueError("图片超过 6MB")
-                chunks.append(chunk)
-            data = b"".join(chunks)
-            break
+            # 评审 v4 P2-4：真流式——边下边断，不先把超大 body 读进内存
+            async with client.stream("GET", current) as resp:
+                if resp.status_code in (301, 302, 303, 307, 308):
+                    location = resp.headers.get("location", "")
+                    if not location:
+                        raise ValueError("图片重定向失败")
+                    current = urljoin(current, location)   # 评审 v4 P2-3：相对路径
+                    continue
+                resp.raise_for_status()
+                size = 0
+                chunks = []
+                async for chunk in resp.aiter_bytes():
+                    size += len(chunk)
+                    if size > _MAX_BYTES:
+                        raise ValueError("图片超过 6MB")
+                    chunks.append(chunk)
+                data = b"".join(chunks)
+                mime = sniff_mime(data) \
+                    or resp.headers.get("content-type", "").split(";")[0].strip()
+                break
     if not data:
         raise ValueError("图片下载为空")
     if len(data) < 100:
