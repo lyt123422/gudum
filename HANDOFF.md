@@ -1,90 +1,101 @@
-# gudum（deepseek-qq-bot）代码评审交接 v2
+# gudum（deepseek-qq-bot）代码评审交接 v3
 
-> 代码快照：2026-10-25 晚（v2：插件体系/抖音/看图等新功能后）
+> 代码快照：2026-10-25 晚（v3：v2 修复落地 + 网页版抖音移除 + 安卓真机版上线后）
 > 项目路径：`C:\Users\john\.zcode\workspace\default\deepseek-qq-bot`
-> 技术栈：Python 3.13 · NoneBot2 + OneBot v11 · FastAPI 本地面板 · NapCat 协议端 · DrissionPage（浏览器自动化）
-> 用途：交给评审 AI 做全面检验。自包含，不需要原对话上下文。行号可能漂移，以实际代码为准。
+> 技术栈：Python 3.13 · NoneBot2 + OneBot v11 · FastAPI 本地面板 · NapCat 协议端 · uiautomator2（可选真机）
+> 用途：交给评审 AI 做检验。自包含。行号可能漂移，以实际代码为准。
 
 ## 0. 给评审 AI
 
-请先通读本文和 `app/` 全部源码，重点审 v2 新增部分（第 3 节），输出：问题清单（按 P0-P3 分级）+
-具体修复建议。只读评审：不要改代码、不要动 `napcat/` 和 `.env`、不要真开浏览器刷抖音。
-上一轮评审（CSRF/XSS/注入/脱敏等）已修复并验证，可抽查但不必重查。
+请先通读本文与 `app/` 源码，重点审第 3 节（v2 修复落实验证 + v3 新增）。
+只读评审：不改文件、不动 `napcat/`、不读写真实 `.env` 值、**绝不触碰已连接的安卓真机**
+（不要调用 douyin.connect/start——测试者手机可能正插在电脑上）。
+输出：问题清单按 P0-P3 分级 + 位置 + 修复建议（带代码）。
 
-## 1. 项目概述
+## 1. 概述与架构
 
-开源免费的本地 QQ AI 聊天搭子：用户填任意 OpenAI 兼容模型 API + QQ 小号扫码登录，
-私聊直聊/群@/发图聊天，多人设库（称呼/开场白/示例对话/防越狱/专属音色）、会话记忆、
-本地 Web 控制台（模型提供商分档档案/人设管理/插件市场/运行控制/日志）、可选插件（联网搜索/
-角色语音/表情包/刷抖音遥控）。初心是开源给不会搭建的小白用。
-
-## 2. 架构（三进程 + 一个可选浏览器）
+开源免费的本地 QQ AI 聊天搭子：任意 OpenAI 兼容模型 API + QQ 小号扫码，私聊/群@/发图聊天，
+多人设库、会话记忆、本地控制台、可选插件。
 
 ```
-控制台 panel   127.0.0.1:8090  app/panel.py + panel_page.html（侧边栏六页）
+控制台 panel   127.0.0.1:8090  app/panel.py + panel_page.html
 机器人内核     127.0.0.1:8081  NoneBot2(app/main.py) + 内置插件(app/plugins/*)
-QQ协议端 NapCat                app/napcat_runner.py 拉起，反向 WS 连内核
-抖音浏览器（可选）             DrissionPage 接管 Chrome，data/douyin_profile 存登录态
+QQ协议端 NapCat               app/napcat_runner.py 拉起，反向 WS 连内核
+安卓真机（可选）              uiautomator2 over adb，app/douyin.py
 ```
 
-## 3. v2 新增（本轮评审重点）
+## 2. v2 评审修复（已实施+已验证，请抽查勿重查）
 
-### 3.1 插件体系（`app/plugin_manager.py` + 面板「🧩 插件」页）
-- 内置插件（websearch/voice/memes/douyin）：`data/plugins.json` 开关，2 秒缓存，运行时生效
-- 第三方市场：pip 白名单（`local:` 前缀=本地插件，安装=装依赖+开启；其余 pip 安装+重启内核），
-  失败自动换清华镜像重试
-- 自测过：白名单拒绝任意包名；本地插件安装实测成功
+- P0-1 掩码 Key：前端切换提供商不回填 Key；服务端 `_looks_masked()` 拒绝；
+  `/api/test` 按 base_url 只查用户自己的档案
+- P1-1 保存真重启：before 快照前移 + `_restart_kernel_if_running()`（身份校验/等端口/轮询 healthz）
+- P1-4 插件安装后按 `healthz.plugins` 验证真加载；MARKET 显式 module 字段
+- P1-5 看图 base64：`app/vision.py`（域名白名单/≤6MB/魔数→data URL），失败不调模型
+- P1-3/P1-6/P1-4 会话锁/端口精确解析/日志脱敏强化
+- P2 全批：群聊指令 `_cmd_gate`、昵称白名单、认领码 secrets+TTL+限次、TTS 出锁+超时、
+  `_split_chunk` 句切、无界字典 `_trim`、X-Frame-Options 等（详单见 git log 0fecf4a）
+- 回归：`tests/test_fixes.py` 15 用例（离线 mock，绝不触碰真机/真实 .env）
 
-### 3.2 抖音遥控（`app/douyin.py` + `app/plugins/douyin.py`）——重点审
-- 线程模型：浏览器生命周期用 `browser_lock` 串行；自动刷是后台线程；watchdog 空闲 20 分钟关浏览器；
-  所有 QQ 指令经 `asyncio.to_thread` 进线程池
-- 行为库：随机停留/滑动 + 8% 翻评论区 + 5% 进作者主页 + 10% 回看 + 概率点赞
-- 选择器：多候选 + JS 递归穿透 shadow DOM（抖音播放器是 web-component）——**未在真实登录态验证过**
-- 限幅：单次 ≤60 分钟、每日 ≤120 分钟、仅管理员、评论仅人工触发
-- 建议重点审：跨线程共享 DrissionPage page 对象是否安全、_act/_ensure_page 的锁序、
-  page.back() 离开推荐流后的恢复、异常后 page 对象失效的处理
+## 3. v3 新增（本轮评审重点）
 
-### 3.3 看图（`app/plugins/chat.py` `_extract_images` + `_do_chat` images 参数）
-- 发图按 OpenAI vision 格式（image_url 内容块）发给模型；QQ 图片 URL 是多媒体域名签名 URL
-- **已知疑点请评审**：QQ 图片 URL（multimedia.nt.qq.com.cn，带签名有时效）由模型服务端拉取，
-  换了部署位置/过期的 URL 是否会 403？是否应该下载后转 base64 上传？
-- 记忆只存文字（q 字符串），图不进记忆——请确认该取舍是否合理
+### 3.1 安卓真机刷抖音（`app/douyin.py` + `app/plugins/douyin.py`）——最大新增
+- 历史：网页版（DrissionPage 抓画面）已**整体移除**（提交 2883ea8，用户判定"截屏≠刷视频"）；
+  现为 uiautomator2 控制安卓真机：真滑动/真声音/真双击点赞
+- 线程模型：`dev_lock` 保护 device 引用；AI 决策在同步线程里每次 `asyncio.run()` 新建客户端
+  （AsyncOpenAI 连接池不跨循环复用——修过一个 coroutine 未 await 的 bug）
+- 会话循环：连接→开抖音→解锁检查→两帧截图（间隔4~6s）→视觉模型决策→执行→
+  连续刷6~12min歇1~3min；AI 连续 3 次失败=结束会话（无脚本兜底，用户要求删掉脚本模式）
+- 限幅：单次≤60min、每日≤120min（data/douyin_daily.json 原子写）、仅管理员
+- adb：缺失时自动从 Google 下载 platform-tools 到 tools/adb/（`download_adb`）
+- 已知风险请评审：
+  a) `_frame()` 对 u2 返回类型的 PIL/numpy 双路处理是否稳
+  b) 手机中途拔线/锁屏 的路径（现仅记 last_error 结束会话，会不会留半截状态）
+  c) `_double_tap_like` 双击间隔 0.08s 是否会被抖音判定非人类
+  d) `connect()` 首次 u2 初始化需要手机上确认安装——失败路径的用户引导是否够
 
-### 3.4 其他 v2 功能（常规审即可）
-- 角色语音（`app/tts.py` edge-tts，按用户开关 `data/voice_users.json`，人设 `# 语音:` 元信息）
-- 表情包（`app/plugins/memes.py` 回复图片消息收录，本地库）
-- 用户称呼（`叫我 XX`，学 SillyTavern {{user}} 注入 system prompt；人设 `# 称呼:` 兜底）
-- 管理员认领码（6 位数字，面板展示，私聊+认领码双条件，防抢注）
-- 上线通知默认关（`BOT_ONLINE_NOTIFY`，曾因频繁重启轰炸管理员导致 QQ 风控禁言——实测事故）
+### 3.2 聊天上下文注入抖音状态（`app/plugins/chat.py` `_do_chat`）
+- 用户消息含"抖音/视频/刷"时，注入系统消息：手机连接/是否在刷/最近5条 AI 决策（带理由）
+- 已实测：手机未连时问"视频怎么样"→如实答"没在刷"（此前会瞎编"不存在"）
+- 请评审：注入的是否该包"不可信"外壳；决策文本来自模型输出，是否有注入面
 
-## 4. 已修复（上一轮评审，已验证，不必重查）
+### 3.3 其他 v3
+- 人设四段格式新增 `# 称呼:`（用户自设称呼优先，学 SillyTavern {{user}}）
+- 上线通知默认关（`BOT_ONLINE_NOTIFY`，曾因频繁重启轰炸管理员→QQ 风控禁言，实测事故）
+- 发送被 QQ 风控拦截（Ban state forbit write req）捕获 ActionFailed 记日志不崩
+- 群聊指令门 `_cmd_gate`（群内需@或/前缀）
 
-面板 CSRF（Content-Type/Origin/Sec-Fetch 三层 415/403）、人设名 XSS（textContent+白名单+CSP）、
-Key 全接口掩码、.env 注入防护（禁 \r\n\0 + 键名白名单）、日志脱敏（sk-/DEEPSEEK_API_KEY/Bearer）、
-端口精确列解析、会话锁+重置代数、同值保存不重启、发送被 QQ 风控拦截不崩溃（ActionFailed 捕获）。
+## 4. 已知问题/待办（诚实清单）
 
-## 5. 已知问题/待办（诚实清单）
+1. 真机自动化违反抖音用户协议，有账号风控风险（文档已声明，限幅写死）
+2. 真机 AI 每条视频 2 次截图+1 次视觉调用：成本与节奏用户自担（面板无预算限制——P1-7 类老问题仍在）
+3. 面板无鉴权（本机绑定+Host+CSRF 三层）；多用户场景需 token
+4. 协议端是面板子进程（面板退出连带重启；用户接受现状）
+5. 真机 v1 未做：评论（仅人工）、搜索、翻评论区（网页版有、真机版还没移植）
+6. `tests/test_fixes.py` 曾因真机在位误触真实会话（已修：mock connect + tearDown stop）——
+   评审请检查是否还有别的测试会碰真环境
 
-1. QQ 图片 URL 疑点（见 3.3）——最想让你审的一条
-2. 抖音选择器未经真实登录态验证（见 3.2）
-3. 面板仍无鉴权（仅本机绑定+Host+CSRF 三层）；多用户场景需 token
-4. 协议端是面板子进程，面板退出连带重启（用户接受现状；P1-2 方案待定）
-5. 抖音每日额度/点赞率写死在代码常量，未做面板配置
-6. mock 测试（tools/mock_onebot_test.py）会短暂改写 .env 的 SUPERUSERS（有 try/finally 还原）
+## 5. 已踩坑（别重查）
 
-## 6. 已踩坑（别花时间重发现）
+- 中文 Windows netstat GBK → subprocess 必须 errors="replace"
+- NapCat 读内层 napcat/napcat/config/，且要给所有历史账号写配置
+- 反向 WS 必带 X-Self-ID；OneBot 事件缺 message_id 被静默降级；回信走 send_msg
+- 面板异步接口禁止同步阻塞；onebot 事件类名 FriendAddNoticeEvent
+- QQ 发送端风控 Ban state forbit write req = 临时禁言
+- DrissionPage 已随网页版移除；真机用 uiautomator2 3.7.1（u2.connect 需 atx 代理就绪）
+- AsyncOpenAI 客户端不能跨事件循环复用（同步线程里每次 asyncio.run 须新建客户端）
 
-- 中文 Windows netstat 输出 GBK，subprocess 必须 errors="replace"
-- NapCat 实际读内层 `napcat/napcat/config/onebot11_<QQ>.json`，且要给所有历史账号都写
-- 反向 WS 客户端必须带 X-Self-ID；事件缺 message_id 被静默降级；回信走 send_msg 动作
-- 面板异步接口禁止同步阻塞（曾致整面板假死）；onebot v11 类名是 FriendAddNoticeEvent
-- QQ 发送端风控：`Ban state forbit write req` = 临时禁言，新号高频私聊同一个人易触发
-- DrissionPage 用法：page.ele("css:..."), page.scroll.down(px), page.get_screenshot(path=)
-
-## 7. 验证工具
+## 6. 验证工具
 
 ```bat
 .venv\Scripts\python.exe -m app.check_api          :: 模型连通
-.venv\Scripts\python.exe tools\mock_onebot_test.py :: E2E 回归（不碰真实 QQ，自动还原配置）
-.venv\Scripts\python.exe -m ruff check app tools --select F,E9,ASYNC,B,UP041
+.venv\Scripts\python.exe -m unittest discover tests :: 15 用例（不碰真机/真实 .env）
+.venv\Scripts\python.exe -m ruff check app tools tests --select F,E9,ASYNC,B,UP041
 ```
+
+## 7. 评审建议关注点（按优先级）
+
+1. `app/douyin.py`：线程/设备生命周期、asyncio.run 每次新建客户端的正确性、异常路径是否留僵尸状态
+2. `app/plugins/chat.py`：_do_chat 的注入面（搜索资料、抖音状态、称呼、vision）是否都可信边界清晰
+3. `app/panel.py`：save/test/providers 的 Key 流转是否还有掩码泄漏路径
+4. `app/plugin_manager.py`：local 插件安装/卸载与内核重启验证的竞态
+5. Windows 特有坑有没有漏网

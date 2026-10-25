@@ -290,6 +290,21 @@ def _ai_decide(shot1: bytes, shot2: bytes) -> dict:
 
 # ---------- 真机操作 ----------
 
+_recent: list[str] = []   # 最近 AI 决策（最新在后），供聊天上下文引用
+
+
+def recent_decisions() -> list[str]:
+    return list(_recent)
+
+
+def _record_decision(d: dict) -> None:
+    name = {"next": "划走", "like": "点赞", "watch": "多看",
+            "follow": "关注"}.get(d["action"], d["action"])
+    _recent.append(f"{name}（{d['reason']}）")
+    if len(_recent) > 8:
+        del _recent[:-8]
+
+
 def _swipe_next(dev) -> None:
     """上滑切下一条：起止点带随机偏移，时长随机（真人手势）。"""
     w, h = dev.window_size()
@@ -387,6 +402,7 @@ def _ai_session_loop(minutes: int) -> None:
                 _pause_aware_sleep(random.uniform(3, 6))
                 continue
             logger.info("🤖 AI 刷抖音(真机): {} ({})", d["action"], d["reason"])
+            _record_decision(d)
             try:
                 if d["action"] == "like":
                     _double_tap_like(dev)
