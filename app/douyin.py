@@ -19,6 +19,8 @@ import time
 from pathlib import Path
 from urllib.parse import quote
 
+from nonebot.log import logger
+
 ROOT = Path(__file__).resolve().parents[1]
 PROFILE_DIR = ROOT / "data" / "douyin_profile"
 SHOT_DIR = ROOT / "data" / "douyin_shots"
@@ -40,6 +42,11 @@ _COMMENT_OPEN = ['xg-icon[data-e2e="video-player-comment"]',
 _AUTHOR_LINKS = ['a[data-e2e="video-author-avatar"]',
                  '[data-e2e="video-author"] a',
                  'a[href*="/user/"]']
+# 沉浸式播放器的判定标记：URL 带这些才算"在刷视频"（否则是门户宫格页）
+_FEED_MARKERS = ("modal_id=", "/video/", "/discover")
+_FEED_CARD_SELECTORS = ['[class*="waterfall-videoCardContainer"]',   # 实测：jingxuan 落地页的视频卡
+                        '[data-e2e="scroll-list"] li:first-child a',
+                        'a[href*="/video/"]']
 
 _state: dict = {"page": None, "browser_lock": threading.Lock(),
                 "thread": None, "stop": threading.Event(),
@@ -186,6 +193,49 @@ def _close_page() -> None:
             pass
 
 
+def _in_feed(page) -> bool:
+    """是否已在沉浸式竖滑播放器里（而不是门户宫格落地页）。"""
+    url = page.url or ""
+    if any(m in url for m in _FEED_MARKERS):
+        return True
+    try:
+        return bool(page.ele('css:[data-e2e="video-player"]', timeout=0.5))
+    except Exception:
+        return False
+
+
+def _enter_feed(page) -> bool:
+    """从宫格页点进第一个视频，进入沉浸式播放器（实测：不点进去就只是滚网页）。"""
+    for sel in _FEED_CARD_SELECTORS:
+        try:
+            ele = page.ele(f"css:{sel}", timeout=0.8)
+            if not ele:
+                continue
+            ele.click()
+            time.sleep(random.uniform(2, 3.5))
+            if _in_feed(page):
+                return True
+        except Exception:
+            continue
+    return False
+
+
+def _wheel(page, dy: int) -> bool:
+    """真实滚轮事件切换视频——抖音沉浸流认 wheel，不认 JS 滚动。"""
+    try:
+        page.actions.scroll(delta_y=dy)
+        return True
+    except Exception:
+        pass
+    try:   # 兜底：方向键在沉浸流里同样切视频
+        key = "ArrowDown" if dy > 0 else "ArrowUp"
+        page.actions.key_down(key)
+        page.actions.key_up(key)
+        return True
+    except Exception:
+        return False
+
+
 def _find_and_click(page, selectors: list[str]) -> tuple[bool, str]:
     """多候选选择器点击；先试普通 DOM，再进 shadow DOM 找 web-component。"""
     for sel in selectors:
@@ -227,7 +277,7 @@ def _browse_comments(page) -> bool:
         return False
     time.sleep(random.uniform(1.5, 3))
     for _ in range(random.randint(1, 3)):
-        page.scroll.down(random.randint(150, 350))
+        _wheel(page, random.randint(180, 320))   # 评论区是滚轮列表，不是翻页
         time.sleep(random.uniform(1, 2.5))
     # 再点一次关闭（评论按钮是开关），失败按 Esc 兜底
     _find_and_click(page, _COMMENT_OPEN)
@@ -290,6 +340,11 @@ def _scroll_loop(minutes: int) -> None:
                     break
             # 动作与睡眠都在锁外：status/stop 不被 5~15 秒睡眠卡住
             try:
+                # 实测踩坑：douyin.com 首页是宫格落地页，必须先进沉浸式播放器，
+                # 否则"滑动"只是在滚一个普通网页（抽象行为真题）
+                if not _in_feed(page) and not _enter_feed(page):
+                    page.get("https://www.douyin.com/?recommend=1", timeout=20)
+                    continue
                 roll = random.random()
                 browsed = False
                 if roll < 0.08:
@@ -298,10 +353,21 @@ def _scroll_loop(minutes: int) -> None:
                     browsed = _visit_author(page)       # 5% 进作者主页逛逛
                 if not browsed:
                     if random.random() < 0.1:           # 偶尔回看上一条
-                        page.scroll.up(random.randint(400, 800))
+                        _wheel(page, -random.randint(600, 1000))
                         time.sleep(random.uniform(3, 6))
-                    page.scroll.down(random.randint(350, 800))
+                    _wheel(page, random.randint(600, 1000))   # 滚轮切下一条
                 _touch()
+                # 连续刷 6~12 分钟后小歇 1~3 分钟（真人节奏，评审对照成熟养号工具）
+                if time.time() - _state.get("last_rest", _state["started_at"]) \
+                        > random.uniform(360, 720):
+                    _state["last_rest"] = time.time()
+                    rest = random.uniform(60, 180)
+                    logger.info("抖音散步：连续刷了一阵，休息 {:.0f}s", rest)
+                    rest_end = time.time() + rest
+                    while time.time() < rest_end and not stop.is_set():
+                        if _state["pause"].is_set():
+                            break
+                        time.sleep(1)
                 # 自动点赞：按概率给当前这条点个赞（真人也这样）
                 if random.random() < _state["like_rate"]:
                     ok, _ = _find_and_click(page, _LIKE_SELECTORS)
@@ -420,7 +486,9 @@ def _act(fn):
 
 def next_video() -> tuple[bool, str]:
     def _do(page):
-        page.scroll.down(random.randint(350, 800))
+        if not _in_feed(page):
+            _enter_feed(page)
+        _wheel(page, random.randint(600, 1000))
         return True, "下一条"
     return _act(_do)
 
