@@ -1127,3 +1127,129 @@ class TestInjectionPosition(unittest.TestCase):
         # 开头 system_prompt 里不得再拼接自我状态（防缓存破坏）
         head = src[:src.index("example_messages(active)")]
         self.assertNotIn("render_self_state", head)
+
+
+class _FakeMsg:
+    def __init__(self, content=None, tool_calls=None):
+        self.content = content
+        self.tool_calls = tool_calls
+
+
+class _FakeTC:
+    def __init__(self, name, args, tid="t1"):
+        self.id = tid
+        self.function = type("F", (), {"name": name, "arguments": args})()
+
+    def model_dump(self):
+        return {"id": self.id, "type": "function",
+                "function": {"name": self.function.name,
+                             "arguments": self.function.arguments}}
+
+
+class _FakeResp:
+    def __init__(self, msg):
+        self.choices = [type("C", (), {"message": msg})()]
+
+
+class _FakeCompletions:
+    def __init__(self, script):
+        self.script = list(script)
+        self.calls = []
+
+    async def create(self, **kw):
+        self.calls.append(kw.get("messages"))
+        item = self.script.pop(0)
+        if isinstance(item, Exception):
+            raise item
+        return _FakeResp(item)
+
+
+class _FakeOAI:
+    def __init__(self, script):
+        self.chat = type("ChatNS", (), {})()
+        self.chat.completions = _FakeCompletions(script)
+
+
+def _tool_client(script):
+    from app.deepseek_api import DeepSeekClient
+    client = DeepSeekClient("http://x", "sk-test", "m")
+    client._client = _FakeOAI(script)
+    return client
+
+
+class TestChatTools(unittest.TestCase):
+    """折中 Agent（评审 v4）：chat_with_tools 工具循环，离线 mock。"""
+
+    def test_tool_round_then_answer(self):
+        tc = _FakeTC("web_search", '{"query":"AI新闻"}')
+        client = _tool_client([
+            _FakeMsg(None, [tc]),
+            _FakeMsg("这是搜索后的回答", None),
+        ])
+        used = []
+
+        async def executor(name, args):
+            used.append((name, args))
+            return "[1] 某新闻"
+
+        result = asyncio.run(client.chat_with_tools(
+            [{"role": "user", "content": "搜新闻"}],
+            tools=[{"type": "function", "function": {"name": "web_search"}}],
+            tool_executor=executor))
+        self.assertIn("搜索后的回答", result)
+        self.assertEqual(used, [("web_search", {"query": "AI新闻"})])
+        self.assertEqual(len(client._client.chat.completions.calls), 2)
+        self.assertTrue(any(m.get("role") == "tool"
+                            for m in client._client.chat.completions.calls[1]))
+
+    def test_bad_json_args_becomes_empty(self):
+        tc = _FakeTC("web_search", "不是JSON")
+        client = _tool_client([
+            _FakeMsg(None, [tc]),
+            _FakeMsg("好了", None),
+        ])
+        used = []
+
+        async def executor(name, args):
+            used.append(args)
+            return "ok"
+
+        asyncio.run(client.chat_with_tools(
+            [{"role": "user", "content": "q"}],
+            tools=[{"type": "function", "function": {"name": "web_search"}}],
+            tool_executor=executor))
+        self.assertEqual(used, [{}])
+
+    def test_max_rounds_forces_summary(self):
+        tc = _FakeTC("web_search", "{}")
+        client = _tool_client([
+            _FakeMsg(None, [tc]),
+            _FakeMsg(None, [tc]),
+            _FakeMsg("总结好了", None),
+        ])
+        used = []
+
+        async def executor(name, args):
+            used.append(name)
+            return "r"
+
+        result = asyncio.run(client.chat_with_tools(
+            [{"role": "user", "content": "q"}],
+            tools=[{"type": "function", "function": {"name": "web_search"}}],
+            tool_executor=executor, max_rounds=2))
+        self.assertEqual(result, "总结好了")
+        self.assertEqual(len(used), 2)
+
+    def test_fallback_sentinel(self):
+        import openai as _openai
+        err = _openai.BadRequestError("message=tools not supported",
+                                      response=mock.Mock(),
+                                      body=None)
+        client = _tool_client([err])
+        from app.deepseek_api import DeepSeekError
+        with self.assertRaises(DeepSeekError) as ctx:
+            asyncio.run(client.chat_with_tools(
+                [{"role": "user", "content": "q"}],
+                tools=[{"type": "function", "function": {"name": "web_search"}}],
+                tool_executor=lambda n, a: "x"))
+        self.assertTrue(getattr(ctx.exception, "fallback", False))

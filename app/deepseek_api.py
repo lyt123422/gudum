@@ -115,3 +115,91 @@ class DeepSeekClient:
         if not text:
             raise DeepSeekError("AI 没有返回内容，请换个问法试试")
         return text
+
+    async def chat_with_tools(self, messages: list[dict], tools: list[dict],
+                              tool_executor, max_rounds: int = 2,
+                              temperature: float | None = None) -> str:
+        """带工具调用的对话（折中 Agent，评审 v4）：
+
+        AI 自主决定调用哪个工具 → tool_executor(name, args) 执行 → 结果回填 →
+        AI 继续，直到给出最终回答（最多 max_rounds 轮工具调用）。
+        服务商不支持 tools（BadRequest 提到 tool/function）时抛
+        DeepSeekError且带 fallback=True 属性，由调用方降级为普通对话。
+        """
+        import json as _json
+        msgs = list(messages)
+        try:
+            for _ in range(max_rounds):
+                resp = await self._client.chat.completions.create(
+                    model=self.model,
+                    messages=msgs,  # type: ignore[arg-type]
+                    tools=tools,
+                    tool_choice="auto",
+                    max_tokens=self.max_tokens,
+                    temperature=(self.temperature
+                                 if temperature is None else temperature),
+                    stream=False,
+                )
+                msg = resp.choices[0].message if resp.choices else None
+                if msg is None or not msg.tool_calls:
+                    text = ((msg.content if msg else "") or "").strip()
+                    if not text:
+                        raise DeepSeekError("AI 没有返回内容，请换个问法试试")
+                    return text
+                msgs.append({"role": "assistant", "content": msg.content or "",
+                             "tool_calls": [tc.model_dump()
+                                            for tc in msg.tool_calls]})
+                for tc in msg.tool_calls:
+                    try:
+                        args = _json.loads(tc.function.arguments or "{}")
+                        if not isinstance(args, dict):
+                            args = {}
+                    except ValueError:
+                        args = {}
+                    result = await tool_executor(tc.function.name, args)
+                    msgs.append({"role": "tool", "tool_call_id": tc.id,
+                                 "content": str(result)[:4000]})
+            # 轮次用尽：让模型基于已收集的信息直接回答
+            msgs.append({"role": "system",
+                         "content": "工具轮次已用完，请基于以上信息直接回答用户。"})
+            resp = await self._client.chat.completions.create(
+                model=self.model,
+                messages=msgs,  # type: ignore[arg-type]
+                max_tokens=self.max_tokens,
+                temperature=(self.temperature
+                             if temperature is None else temperature),
+                stream=False,
+            )
+            text = (resp.choices[0].message.content or "").strip() \
+                if resp.choices else ""
+            if not text:
+                raise DeepSeekError("AI 没有返回内容，请换个问法试试")
+            return text
+        except openai.BadRequestError as exc:
+            detail = str(exc).lower()
+            if "tool" in detail or "function" in detail:
+                fallback = DeepSeekError(
+                    "当前模型/服务不支持工具调用，已降级为普通对话", str(exc)[:200])
+                fallback.fallback = True
+                raise fallback from exc
+            raise DeepSeekError(
+                "请求被模型拒绝（上下文可能太长，发「重置」清空记忆再试）",
+                str(exc)[:300]) from exc
+        except openai.AuthenticationError as exc:
+            raise DeepSeekError(
+                "API Key 无效：请检查 .env 里的 Key 是否填对", str(exc)) from exc
+        except openai.RateLimitError as exc:
+            raise DeepSeekError("请求太频繁啦，稍等几秒再试～", str(exc)) from exc
+        except openai.APITimeoutError as exc:
+            raise DeepSeekError("模型响应超时了，再发一次试试", str(exc)) from exc
+        except openai.APIConnectionError as exc:
+            raise DeepSeekError("连不上模型服务，请检查本机网络", str(exc)) from exc
+        except openai.APIStatusError as exc:
+            if exc.status_code == 402:
+                raise DeepSeekError("账户余额不足，请到对应平台充值", str(exc)) from exc
+            raise DeepSeekError(
+                f"模型服务返回错误（HTTP {exc.status_code}）",
+                str(exc)[:300]) from exc
+        except Exception as exc:
+            raise DeepSeekError("AI 服务出了点小问题，请稍后再试",
+                                str(exc)[:300]) from exc

@@ -74,6 +74,53 @@ TTS_VOICE = _cfg("TTS_VOICE", "zh-CN-XiaoxiaoNeural")
 # 用多模态模型时设 VISION_ENABLED=true，图片默认在本机下载转 base64 上传
 VISION_ENABLED = _cfg("VISION_ENABLED", "false").lower() in ("true", "1", "yes")
 VISION_INPUT_MODE = _cfg("VISION_INPUT_MODE", "base64")   # base64 | url
+# 折中 Agent（评审 v4）：AI 可自主调用低风险工具（联网/查抖音状态/表情库），
+# 高风险动作（发消息/抖音触控）仍只由指令触发，脚本执行
+AGENT_TOOLS = _cfg("AGENT_TOOLS", "true").lower() in ("true", "1", "yes")
+
+_TOOLS_SPEC = [
+    {"type": "function", "function": {
+        "name": "web_search",
+        "description": "联网搜索最新资料，返回带编号的搜索结果",
+        "parameters": {"type": "object",
+                       "properties": {"query": {"type": "string",
+                                                "description": "搜索关键词"}},
+                       "required": ["query"]}}},
+    {"type": "function", "function": {
+        "name": "douyin_status",
+        "description": "查询抖音真机助手的当前状态（是否在刷/今日用量/是否连接）",
+        "parameters": {"type": "object", "properties": {}}}},
+    {"type": "function", "function": {
+        "name": "memes_list",
+        "description": "列出表情包库里已收录的表情名",
+        "parameters": {"type": "object", "properties": {}}}},
+]
+
+
+async def _tool_executor(name: str, args: dict) -> str:
+    """工具执行器：只做低风险只读操作，结果作为文本回给模型。"""
+    logger.info("🛠 工具调用: {} {}", name, args)
+    if name == "web_search":
+        query = str(args.get("query") or "").strip()
+        if not query:
+            return "缺少搜索关键词"
+        results = await web_search.search(
+            query, provider=SEARCH_PROVIDER, tavily_key=TAVILY_API_KEY)
+        if not results:
+            return "没有搜到结果"
+        return "\n".join(f"[{i}] {r['title']}\n{r['snippet']}\n{r['url']}"
+                         for i, r in enumerate(results, 1))
+    if name == "douyin_status":
+        from .. import douyin   # noqa: PLC0415
+        s = douyin.status()
+        return (f"运行中={s['running']} 暂停={s['paused']} "
+                f"手机连接={s['connected']} 今日已刷={s['today_min']}分钟 "
+                f"上次异常={s['last_error'] or '无'}")
+    if name == "memes_list":
+        from .plugins import memes as _memes   # noqa: PLC0415
+        names = [f.stem for f in _memes._meme_files()]
+        return "表情库：" + ("、".join(names[:20]) if names else "空")
+    return f"未知工具: {name}"
 
 # 破甲（回答尺度）：admin=只对管理员生效（默认，群里路人拿不到无限制回答）；all=所有人
 JAILBREAK_SCOPE = _cfg("JAILBREAK_SCOPE", "admin").lower()
@@ -600,7 +647,18 @@ async def _do_chat(matcher, event: MessageEvent, q: str,
                 {"type": "image_url", "image_url": {"url": d}} for d in normalized]
             messages[-1]["content"] = content
         try:
-            reply = await client.chat(messages)
+            if AGENT_TOOLS:
+                try:
+                    reply = await client.chat_with_tools(messages, tools=_TOOLS_SPEC,
+                                                         tool_executor=_tool_executor)
+                except DeepSeekError as fb_exc:
+                    if not getattr(fb_exc, "fallback", False):
+                        raise
+                    logger.warning("模型不支持工具调用，降级普通对话: {}",
+                                   fb_exc.message)
+                    reply = await client.chat(messages)
+            else:
+                reply = await client.chat(messages)
         except FinishedException:
             raise
         except DeepSeekError as exc:
@@ -608,6 +666,7 @@ async def _do_chat(matcher, event: MessageEvent, q: str,
             logger.warning("模型调用失败 uid={} q={}: {} {}",
                            uid, q[:40], exc.message, redact_log(exc.raw_detail[:200]))
             await matcher.finish(f"😵 {exc.message}")
+            return   # matcher.finish 正常会抛 FinishedException；这里兜底防 reply 未赋值
         if _SESSION_GEN.get(key, 0) != gen:
             return   # 等待期间会话被「重置」了，丢弃过期回复
         # 记忆只存文字 + 轻量图片标记，不存 base64/签名 URL（评审 P1-5.7）
