@@ -1,101 +1,74 @@
-# gudum（deepseek-qq-bot）代码评审交接 v3
+# gudum（deepseek-qq-bot）交接文档 v4 · 外来 AI 开发任务书模板
 
-> 代码快照：2026-10-25 晚（v3：v2 修复落地 + 网页版抖音移除 + 安卓真机版上线后）
-> 项目路径：`C:\Users\john\.zcode\workspace\default\deepseek-qq-bot`
-> 技术栈：Python 3.13 · NoneBot2 + OneBot v11 · FastAPI 本地面板 · NapCat 协议端 · uiautomator2（可选真机）
-> 用途：交给评审 AI 做检验。自包含。行号可能漂移，以实际代码为准。
+> 快照：2026-10-25 晚（v4：shared assistant_state + 真机重写 + v3 评审修复全部落地）
+> 项目：`C:\Users\john\.zcode\workspace\default\deepseek-qq-bot`
+> 技术栈：Python 3.13 · NoneBot2 + OneBot v11 · FastAPI 本地面板 · NapCat 协议端 · uiautomator2 3.7.1（可选真机）
 
-## 0. 给评审 AI
+## 0. 给开发 AI 的硬约束（违反即返工）
 
-请先通读本文与 `app/` 源码，重点审第 3 节（v2 修复落实验证 + v3 新增）。
-只读评审：不改文件、不动 `napcat/`、不读写真实 `.env` 值、**绝不触碰已连接的安卓真机**
-（不要调用 douyin.connect/start——测试者手机可能正插在电脑上）。
-输出：问题清单按 P0-P3 分级 + 位置 + 修复建议（带代码）。
+1. **基线**：先 `git log --oneline | head -3` 确认在最新提交，所有改动基于它；改完单独 commit。
+2. **禁触清单**：`napcat/`（第三方协议端）、真实 `.env` 的值（可读结构不许写/不许输出值）、`data/`（用户记忆/人设/登录态）、`tools/adb/`。
+3. **绝不调用** `douyin.connect()` / `douyin.start()`——测试机手机可能正插着，会真刷。测试一律 FakeDevice/mock。
+4. **安全措施不得削弱**：CSRF 中间件、XSS textContent、Key 掩码（`_looks_masked`）、日志脱敏、`.env` 注入校验、`_cmd_gate`——所有回归测试必须继续通过。
+5. **验证闭环**：`.venv\Scripts\python.exe -m unittest discover tests`（当前 48 用例）+ `.venv\Scripts\python.exe -m ruff check app tools tests --select F,E9,ASYNC,B,UP041` 全绿才算完成。
+6. **部署边界**：开发 AI 不重启内核/面板/QQ 服务（QQ 登录态在；重启由维护方执行）。需要运行时验证的写 NOT RUN + 手工步骤。
+7. **最小 patch**：不改现有指令名/人设格式/记忆格式/面板结构；新功能优先做成**插件或独立模块**。
 
-## 1. 概述与架构
-
-开源免费的本地 QQ AI 聊天搭子：任意 OpenAI 兼容模型 API + QQ 小号扫码，私聊/群@/发图聊天，
-多人设库、会话记忆、本地控制台、可选插件。
+## 1. 架构（三进程 + 可选手机）
 
 ```
-控制台 panel   127.0.0.1:8090  app/panel.py + panel_page.html
+控制台 panel   127.0.0.1:8090  app/panel.py + panel_page.html（页面热加载，改 HTML 不用重启）
 机器人内核     127.0.0.1:8081  NoneBot2(app/main.py) + 内置插件(app/plugins/*)
 QQ协议端 NapCat               app/napcat_runner.py 拉起，反向 WS 连内核
 安卓真机（可选）              uiautomator2 over adb，app/douyin.py
 ```
 
-## 2. v2 评审修复（已实施+已验证，请抽查勿重查）
+- 内核读配置在启动时：改 `.env`/配置类代码需重启内核才生效（QQ 登录不受内核重启影响）
+- `panel_page.html` 每次请求现读：改前端 F5 即生效
+- 共享状态：`app/assistant_state.py`（线程安全）——抖音会话线程写，聊天每轮读（第一人称自我状态注入）
 
-- P0-1 掩码 Key：前端切换提供商不回填 Key；服务端 `_looks_masked()` 拒绝；
-  `/api/test` 按 base_url 只查用户自己的档案
-- P1-1 保存真重启：before 快照前移 + `_restart_kernel_if_running()`（身份校验/等端口/轮询 healthz）
-- P1-4 插件安装后按 `healthz.plugins` 验证真加载；MARKET 显式 module 字段
-- P1-5 看图 base64：`app/vision.py`（域名白名单/≤6MB/魔数→data URL），失败不调模型
-- P1-3/P1-6/P1-4 会话锁/端口精确解析/日志脱敏强化
-- P2 全批：群聊指令 `_cmd_gate`、昵称白名单、认领码 secrets+TTL+限次、TTS 出锁+超时、
-  `_split_chunk` 句切、无界字典 `_trim`、X-Frame-Options 等（详单见 git log 0fecf4a）
-- 回归：`tests/test_fixes.py` 15 用例（离线 mock，绝不触碰真机/真实 .env）
+## 2. 代码地图（改哪里看这里）
 
-## 3. v3 新增（本轮评审重点）
+| 想做的事 | 位置 |
+|---|---|
+| 新 QQ 指令/聊天行为 | `app/plugins/` 新文件或 chat.py；群聊门 `rule=_cmd_gate`；权限用 `_is_admin` |
+| 聊天上下文注入（像 assistant_state 那样） | chat.py `_do_chat`：并入 system_prompt（personas+address 后），**不要**单独追加中途 system 消息（部分服务商拒收） |
+| 新面板页面/卡片 | `app/panel_page.html`（页面）+ `app/panel.py`（/api/*）；前端零依赖原生 JS |
+| 新内置插件 | `app/plugin_manager.py` BUILTIN 加条目 + `app/plugins/<id>.py` + 运行时 `is_enabled` 门 |
+| 新市场插件 | MARKET 加条目（pip 名真实存在 + module 显式）；type=local 表示"装依赖+开启" |
+| 看图/图片输入 | `app/vision.py`（域名白名单/6MB/魔数）+ chat.py `_extract_images`/`_do_chat` |
+| 模型调用 | `app/deepseek_api.py`（OpenAI 兼容，异常全翻译成中文）；聊天/看图/抖音决策共用 `.env` 的模型配置 |
+| 配置项 | `.env.example` 同步新增 + `_cfg("KEY", "默认值")` 读取 |
 
-### 3.1 安卓真机刷抖音（`app/douyin.py` + `app/plugins/douyin.py`）——最大新增
-- 历史：网页版（DrissionPage 抓画面）已**整体移除**（提交 2883ea8，用户判定"截屏≠刷视频"）；
-  现为 uiautomator2 控制安卓真机：真滑动/真声音/真双击点赞
-- 线程模型：`dev_lock` 保护 device 引用；AI 决策在同步线程里每次 `asyncio.run()` 新建客户端
-  （AsyncOpenAI 连接池不跨循环复用——修过一个 coroutine 未 await 的 bug）
-- 会话循环：连接→开抖音→解锁检查→两帧截图（间隔4~6s）→视觉模型决策→执行→
-  连续刷6~12min歇1~3min；AI 连续 3 次失败=结束会话（无脚本兜底，用户要求删掉脚本模式）
-- 限幅：单次≤60min、每日≤120min（data/douyin_daily.json 原子写）、仅管理员
-- adb：缺失时自动从 Google 下载 platform-tools 到 tools/adb/（`download_adb`）
-- 已知风险请评审：
-  a) `_frame()` 对 u2 返回类型的 PIL/numpy 双路处理是否稳
-  b) 手机中途拔线/锁屏 的路径（现仅记 last_error 结束会话，会不会留半截状态）
-  c) `_double_tap_like` 双击间隔 0.08s 是否会被抖音判定非人类
-  d) `connect()` 首次 u2 初始化需要手机上确认安装——失败路径的用户引导是否够
+## 3. 必须知道的坑（踩过，别重踩）
 
-### 3.2 聊天上下文注入抖音状态（`app/plugins/chat.py` `_do_chat`）
-- 用户消息含"抖音/视频/刷"时，注入系统消息：手机连接/是否在刷/最近5条 AI 决策（带理由）
-- 已实测：手机未连时问"视频怎么样"→如实答"没在刷"（此前会瞎编"不存在"）
-- 请评审：注入的是否该包"不可信"外壳；决策文本来自模型输出，是否有注入面
+- 中文 Windows `netstat` 输出 GBK：subprocess 必须 `errors="replace"`
+- NapCat 读**内层** `napcat/napcat/config/onebot11_<QQ>.json`，且要给所有历史账号写
+- 反向 WS 客户端必带 `X-Self-ID` 头；OneBot 事件缺 `message_id` 被静默降级；回信走 `send_msg`
+- 异步接口内禁止同步阻塞（曾致整面板假死）；文件 IO 用 `asyncio.to_thread`
+- AsyncOpenAI 客户端不能跨事件循环复用——同步线程里每次 `asyncio.run` 须新建并 `aclose()`
+- QQ 发送端风控：`Ban state forbit write req`=临时禁言；捕获 ActionFailed 记日志不崩
+- `_restart_poll_delay` 曾自递归（测试 patch 函数本身掩盖了它）——测试禁止 patch 被测函数，只允许 patch 常量
+- 测试曾误触真机（start 返回 True 因为手机真插着）——测试必须 mock connect 且 tearDown 恢复 `_state` 快照
 
-### 3.3 其他 v3
-- 人设四段格式新增 `# 称呼:`（用户自设称呼优先，学 SillyTavern {{user}}）
-- 上线通知默认关（`BOT_ONLINE_NOTIFY`，曾因频繁重启轰炸管理员→QQ 风控禁言，实测事故）
-- 发送被 QQ 风控拦截（Ban state forbit write req）捕获 ActionFailed 记日志不崩
-- 群聊指令门 `_cmd_gate`（群内需@或/前缀）
-
-## 4. 已知问题/待办（诚实清单）
-
-1. 真机自动化违反抖音用户协议，有账号风控风险（文档已声明，限幅写死）
-2. 真机 AI 每条视频 2 次截图+1 次视觉调用：成本与节奏用户自担（面板无预算限制——P1-7 类老问题仍在）
-3. 面板无鉴权（本机绑定+Host+CSRF 三层）；多用户场景需 token
-4. 协议端是面板子进程（面板退出连带重启；用户接受现状）
-5. 真机 v1 未做：评论（仅人工）、搜索、翻评论区（网页版有、真机版还没移植）
-6. `tests/test_fixes.py` 曾因真机在位误触真实会话（已修：mock connect + tearDown stop）——
-   评审请检查是否还有别的测试会碰真环境
-
-## 5. 已踩坑（别重查）
-
-- 中文 Windows netstat GBK → subprocess 必须 errors="replace"
-- NapCat 读内层 napcat/napcat/config/，且要给所有历史账号写配置
-- 反向 WS 必带 X-Self-ID；OneBot 事件缺 message_id 被静默降级；回信走 send_msg
-- 面板异步接口禁止同步阻塞；onebot 事件类名 FriendAddNoticeEvent
-- QQ 发送端风控 Ban state forbit write req = 临时禁言
-- DrissionPage 已随网页版移除；真机用 uiautomator2 3.7.1（u2.connect 需 atx 代理就绪）
-- AsyncOpenAI 客户端不能跨事件循环复用（同步线程里每次 asyncio.run 须新建客户端）
-
-## 6. 验证工具
+## 4. 验证命令
 
 ```bat
-.venv\Scripts\python.exe -m app.check_api          :: 模型连通
-.venv\Scripts\python.exe -m unittest discover tests :: 15 用例（不碰真机/真实 .env）
+.venv\Scripts\python.exe -m unittest discover tests -v      :: 48 用例
 .venv\Scripts\python.exe -m ruff check app tools tests --select F,E9,ASYNC,B,UP041
+.venv\Scripts\python.exe -m app.check_api                    :: 模型连通
 ```
 
-## 7. 评审建议关注点（按优先级）
+## 5. 交付格式（每条功能/修复）
 
-1. `app/douyin.py`：线程/设备生命周期、asyncio.run 每次新建客户端的正确性、异常路径是否留僵尸状态
-2. `app/plugins/chat.py`：_do_chat 的注入面（搜索资料、抖音状态、称呼、vision）是否都可信边界清晰
-3. `app/panel.py`：save/test/providers 的 Key 流转是否还有掩码泄漏路径
-4. `app/plugin_manager.py`：local 插件安装/卸载与内核重启验证的竞态
-5. Windows 特有坑有没有漏网
+```
+[ID] 名称
+[状态] DONE/PARTIAL/SKIP
+[改动] 文件清单
+[实现] 思路 3-5 句
+[测试] 新增用例名 + 全量 48 用例结果（真实输出）
+[部署] 需要重启内核/面板？页面 F5 即生效？
+[NOT RUN] 真机/真 QQ 验证项 + 手工步骤
+```
+
+最后：`git diff --stat`、风险与回滚方式（commit 号）。
