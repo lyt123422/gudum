@@ -111,6 +111,9 @@ pre{background:#0f172a;color:#bbf7d0;font-size:12px;padding:14px;border-radius:1
  <div class="nav" data-p="plugin" onclick="nav('plugin')">🧩 插件</div>
  <div class="nav" data-p="run" onclick="nav('run')">🚀 运行控制</div>
  <div class="nav" data-p="log" onclick="nav('log')">📜 运行日志</div>
+ <div class="nav" data-p="guide" onclick="nav('guide')">📖 使用教程</div>
+ <div class="nav" onclick="window.open('https://pd.qq.com/s/7hbug91t7?b=5','_blank')"
+      title="加入 gudum 交流频道">💬 交流频道 ↗</div>
  <div id="side-foot">
   <span class="dot" id="foot-dot" style="background:#94a3b8"></span><span id="foot-txt">状态加载中</span><br>
   本机控制台 · 127.0.0.1
@@ -227,6 +230,49 @@ pre{background:#0f172a;color:#bbf7d0;font-size:12px;padding:14px;border-radius:1
   </div>
  </div>
 
+ <!-- 使用教程 -->
+ <div class="page" id="pg-guide">
+  <div class="card">
+   <h3>⚡ 三分钟开聊</h3>
+   <div class="desc">从零到第一次收到 AI 回复，只做四件事</div>
+   <div class="step done"><div class="n">1</div><div><b>填模型</b> —— 「🧠 模型配置」选提供商（DeepSeek/智谱/通义/Ollama 本地…）→ 填 API Key → <b>测试连通</b>看到 ✅ → 保存</div></div>
+   <div class="step done"><div class="n">2</div><div><b>连 QQ</b> —— 「🚀 运行控制」启动内核和协议端 → 手机 QQ 用<b>小号</b>扫码（登录一次以后免扫码）</div></div>
+   <div class="step done"><div class="n">3</div><div><b>加好友</b> —— 用你的主号加机器人小号好友</div></div>
+   <div class="step done"><div class="n">4</div><div><b>开聊</b> —— 私聊直接发消息；群里 @它 发言；发图片它也能看（需多模态模型）</div></div>
+  </div>
+  <div class="card">
+   <h3>⌨️ QQ 指令速查</h3>
+   <div class="desc">私聊直接发；群里需要 @机器人</div>
+   <div class="pl-item"><div><div class="nm">聊天</div><div class="ds">直接发文字，带会话记忆（2 小时）；「重置」清空当前记忆</div></div></div>
+   <div class="pl-item"><div><div class="nm">人设</div><div class="ds">「人设列表」看全部 · 「切换人设 名字」换人格 · 「叫我 XX」设定它对你的称呼</div></div></div>
+   <div class="pl-item"><div><div class="nm">联网</div><div class="ds">「联网 问题」强制搜索；问新闻/天气会自动联网</div></div></div>
+   <div class="pl-item"><div><div class="nm">语音</div><div class="ds">「语音开 / 语音关」回复附带角色配音；人设可指定专属音色</div></div></div>
+   <div class="pl-item"><div><div class="nm">表情包</div><div class="ds">回复一张图发「存表情 名字」收录；「表情包 [词]」斗图；「表情列表」</div></div></div>
+   <div class="pl-item"><div><div class="nm">抖音真机</div><div class="ds">「连接手机」首次诊断 → 「刷抖音 分钟」AI 看屏幕真刷（仅管理员，需 USB 连手机）</div></div></div>
+   <div class="pl-item"><div><div class="nm">状态</div><div class="ds">「状态」看模型/Key/人设/记忆 · 「帮助」完整菜单</div></div></div>
+  </div>
+  <div class="card">
+   <h3>🧩 插件怎么用</h3>
+   <div class="desc">「🧩 插件」页分两层：内置插件开关即点即生效；市场里的精选插件点安装自动配置</div>
+   <div class="tip">· 联网搜索 / 角色语音 / 表情包：默认开启，不需要任何配置<br>
+       · 抖音真机：市场点安装（自动装依赖）→ 手机开 USB 调试连电脑 → QQ 发「连接手机」<br>
+       · 市场其他插件：点 ⬇ 安装，完成后内核自动重启加载（QQ 不受影响）</div>
+  </div>
+  <div class="card">
+   <h3>🩺 不回话？三步排查</h3>
+   <div class="desc">90% 的问题在这三步里</div>
+   <div class="step"><div class="n">1</div><div>顶部状态灯：<b>Key 灯</b>没绿 → 模型配置页填 Key 并测试连通（401=Key 错，402=余额不足）</div></div>
+   <div class="step"><div class="n">2</div><div><b>QQ 灯</b>没绿 → 运行控制页看二维码是否过期，重启协议端重扫</div></div>
+   <div class="step"><div class="n">3</div><div>都绿但不回 → 看「📜 运行日志」最后几行；触发了风控会写明"发送被QQ拦截"，等几分钟自动恢复</div></div>
+   <div class="tip">⚠ 风险须知：协议端为第三方方案，只用小号、别刷屏；触控类自动化（抖音真机）频率已内置限幅，请勿外传滥用。</div>
+  </div>
+  <div class="card">
+   <h3>💬 还有问题？</h3>
+   <div class="desc">进交流频道提问、反馈、蹲更新</div>
+   <div class="row"><button onclick="window.open('https://pd.qq.com/s/7hbug91t7?b=5','_blank')">💬 加入 gudum 交流频道</button></div>
+  </div>
+ </div>
+
  <!-- 运行控制 -->
  <div class="page" id="pg-run">
   <div class="card">
@@ -271,7 +317,7 @@ document.addEventListener('click',e=>{const b=e.target.closest('button');
 let PRESETS={},PROFILES={},curProv='',liveProv='';
 
 /* ---------- 导航 ---------- */
-const TITLES={home:'总览',model:'模型配置',persona:'人设管理',plugin:'插件',run:'运行控制',log:'运行日志'};
+const TITLES={home:'总览',model:'模型配置',persona:'人设管理',plugin:'插件',run:'运行控制',log:'运行日志',guide:'使用教程'};
 function nav(p){document.querySelectorAll('.nav').forEach(e=>e.classList.toggle('on',e.dataset.p===p));
  document.querySelectorAll('.page').forEach(e=>e.classList.toggle('on',e.id==='pg-'+p));
  $('page-title').textContent=TITLES[p]}
