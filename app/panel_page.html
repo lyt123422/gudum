@@ -1,0 +1,550 @@
+<!doctype html>
+<html lang="zh"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>gudum · QQ AI 聊天搭子</title>
+<style>
+:root{--side:#0f172a;--side2:#1e293b;--acc:#2563eb;--acc2:#1d4ed8;--bg:#f1f5f9;--card:#fff;
+ --txt:#0f172a;--mut:#64748b;--ok:#16a34a;--okbg:#dcfce7;--err:#dc2626;--errbg:#fee2e2;
+ --warnbg:#fef9c3;--warn:#a16207;--line:#e2e8f0;--radius:14px}
+*{box-sizing:border-box}
+body{font-family:"Microsoft YaHei",system-ui,sans-serif;margin:0;background:var(--bg);color:var(--txt)}
+/* ---------- 左侧导航 ---------- */
+#sidebar{position:fixed;left:0;top:0;bottom:0;width:216px;background:var(--side);color:#cbd5e1;
+ display:flex;flex-direction:column;padding:18px 12px}
+#logo{font-size:24px;font-weight:800;letter-spacing:2px;padding:6px 10px 16px;
+ border-bottom:1px solid var(--side2);margin-bottom:12px;
+ background:linear-gradient(90deg,#a78bfa,#22d3ee,#fbbf24,#f472b6,#a78bfa);
+ background-size:300% 100%;-webkit-background-clip:text;background-clip:text;
+ color:transparent;animation:gudum-flow 6s linear infinite}
+#logo small{display:block;font-size:11px;font-weight:400;color:#94a3b8;margin-top:4px;
+ -webkit-text-fill-color:#94a3b8;letter-spacing:0}
+@keyframes gudum-flow{to{background-position:300% 0}}
+.nav{display:flex;align-items:center;gap:10px;padding:11px 12px;border-radius:10px;cursor:pointer;
+ font-size:14px;margin-bottom:4px;transition:background .15s}
+.nav:hover{background:var(--side2)}
+.nav.on{background:var(--acc);color:#fff;font-weight:600}
+#side-foot{margin-top:auto;font-size:11px;color:#475569;padding:10px;line-height:1.7}
+#side-foot .dot{display:inline-block;width:8px;height:8px;border-radius:50%;margin-right:6px}
+/* ---------- 主区 ---------- */
+#main{margin-left:216px;padding:22px 26px;max-width:980px}
+#topbar{display:flex;align-items:center;justify-content:space-between;margin-bottom:18px;gap:10px;flex-wrap:wrap}
+#page-title{font-size:20px;font-weight:700}
+.chips{display:flex;gap:8px;flex-wrap:wrap}
+.chip{padding:5px 12px;border-radius:99px;font-size:12.5px;background:#e2e8f0;color:var(--mut);display:flex;align-items:center;gap:6px}
+.chip .dot{width:8px;height:8px;border-radius:50%;background:#94a3b8}
+.chip.on{background:var(--okbg);color:#166534}.chip.on .dot{background:var(--ok)}
+.chip.err{background:var(--errbg);color:#991b1b}.chip.err .dot{background:var(--err)}
+.page{display:none}.page.on{display:block}
+.card{background:var(--card);border-radius:var(--radius);padding:20px;margin-bottom:16px;
+ box-shadow:0 1px 3px rgba(15,23,42,.07);border:1px solid var(--line)}
+.card h3{margin:0 0 6px;font-size:15.5px}
+.card .desc{font-size:12.5px;color:var(--mut);margin-bottom:14px}
+label{display:block;font-size:12.5px;color:var(--mut);margin:12px 0 5px}
+input,textarea,select{width:100%;padding:10px 12px;border:1px solid var(--line);border-radius:10px;font-size:14px;background:#fff}
+input:focus,textarea:focus,select:focus{outline:2px solid #bfdbfe;border-color:var(--acc)}
+textarea{resize:vertical}
+.row{display:flex;gap:10px;flex-wrap:wrap;margin-top:14px}
+button{padding:10px 18px;border:none;border-radius:10px;font-size:14px;cursor:pointer;background:var(--acc);color:#fff;transition:filter .15s,transform .08s}
+button:hover{filter:brightness(1.08)}
+button:active{transform:scale(.94);filter:brightness(.85)}   /* 按下物理反馈 */
+#toast{position:fixed;right:20px;bottom:20px;background:#0f172aee;color:#fff;padding:10px 18px;
+ border-radius:10px;font-size:13.5px;opacity:0;pointer-events:none;transition:opacity .25s;z-index:99}
+#toast.show{opacity:1}
+button.green{background:var(--ok)}button.red{background:var(--err)}button.ghost{background:#fff;color:var(--txt);border:1px solid var(--line)}
+button:disabled{opacity:.45;cursor:default}
+pre{background:#0f172a;color:#bbf7d0;font-size:12px;padding:14px;border-radius:10px;max-height:300px;overflow:auto;white-space:pre-wrap;margin:0}
+.msg{font-size:13px;margin-top:10px;min-height:18px}
+.ok{color:var(--ok)}.err{color:var(--err)}
+/* 总览 */
+.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:14px}
+.stat{background:var(--card);border:1px solid var(--line);border-radius:var(--radius);padding:16px 18px}
+.stat .t{font-size:12.5px;color:var(--mut)}
+.stat .v{font-size:16px;font-weight:700;margin-top:6px}
+.stat .v.run{color:var(--ok)}.stat .v.stop{color:var(--err)}
+.step{display:flex;gap:12px;align-items:flex-start;padding:10px 0;border-bottom:1px dashed var(--line);font-size:13.5px}
+.step:last-child{border-bottom:none}
+.step .n{width:22px;height:22px;border-radius:50%;background:#e2e8f0;color:var(--mut);display:flex;
+ align-items:center;justify-content:center;font-size:12px;flex-shrink:0}
+.step.done .n{background:var(--ok);color:#fff}
+.step.done{color:#64748b}
+/* 提供商快捷 */
+.provs{display:flex;gap:8px;flex-wrap:wrap}
+.prov{padding:7px 14px;border-radius:99px;border:1px solid var(--line);cursor:pointer;font-size:13px;background:#fff}
+.prov:hover{border-color:var(--acc);color:var(--acc)}
+.prov.on{background:var(--acc);color:#fff;border-color:var(--acc)}
+/* 人设 */
+/* 人设卡片：头像(名字首字+按名取色) + 开场白预览 + 当前徽标 */
+.p-list{display:grid;grid-template-columns:repeat(auto-fill,minmax(230px,1fr));gap:10px}
+.p-item{border:1.5px solid var(--line);border-radius:14px;padding:13px 14px;cursor:pointer;
+ display:flex;gap:12px;align-items:center;transition:border-color .15s,transform .1s}
+.p-item:hover{border-color:var(--acc);transform:translateY(-1px)}
+.p-item.on{border-color:var(--acc);background:#eff6ff;box-shadow:0 0 0 1px var(--acc) inset}
+.p-avatar{width:44px;height:44px;border-radius:12px;color:#fff;font-size:19px;font-weight:700;
+ display:flex;align-items:center;justify-content:center;flex-shrink:0;user-select:none}
+.p-item .body{min-width:0;flex:1}
+.p-item .nm{font-size:14px;font-weight:600;display:flex;align-items:center;gap:6px}
+.p-badge{font-size:10px;background:var(--okbg);color:#166534;border-radius:99px;
+ padding:1px 8px;font-weight:600;flex-shrink:0}
+.p-greet{font-size:11.5px;color:var(--mut);white-space:nowrap;overflow:hidden;
+ text-overflow:ellipsis;margin-top:3px}
+.p-item .tag{font-size:10.5px;color:#94a3b8;margin-top:3px}
+.pl-item{display:flex;justify-content:space-between;align-items:center;gap:12px;
+ padding:11px 2px;border-bottom:1px dashed var(--line)}
+.pl-item:last-child{border-bottom:none}
+.pl-item .nm{font-size:14px;font-weight:600}
+.pl-item .ds{font-size:12px;color:var(--mut);margin-top:2px;line-height:1.5}
+.pl-item .cat{font-size:10px;background:#e0e7ff;color:#3730a3;border-radius:99px;
+ padding:1px 8px;margin-left:6px;vertical-align:1px}
+.pl-btns{display:flex;gap:8px;flex-shrink:0}
+#qr{max-width:250px;border:1px solid var(--line);border-radius:12px;display:none;margin-top:10px}
+.tip{font-size:12px;color:var(--mut);margin-top:8px;line-height:1.7}
+@media(max-width:760px){#sidebar{position:static;width:100%;flex-direction:row;overflow-x:auto;padding:8px}
+ #logo{border:none;padding:8px;white-space:nowrap}#side-foot{display:none}
+ #main{margin-left:0;padding:14px}.nav{white-space:nowrap}}
+</style></head><body>
+
+<div id="sidebar">
+ <div id="logo">gudum<small>QQ AI 聊天搭子 · 控制台</small></div>
+ <div class="nav on" data-p="home" onclick="nav('home')">🏠 总览</div>
+ <div class="nav" data-p="model" onclick="nav('model')">🧠 模型配置</div>
+ <div class="nav" data-p="persona" onclick="nav('persona')">🎭 人设管理</div>
+ <div class="nav" data-p="plugin" onclick="nav('plugin')">🧩 插件</div>
+ <div class="nav" data-p="run" onclick="nav('run')">🚀 运行控制</div>
+ <div class="nav" data-p="log" onclick="nav('log')">📜 运行日志</div>
+ <div id="side-foot">
+  <span class="dot" id="foot-dot" style="background:#94a3b8"></span><span id="foot-txt">状态加载中</span><br>
+  本机控制台 · 127.0.0.1
+ </div>
+</div>
+
+<div id="main"> <div id="topbar">
+  <div id="page-title">总览</div>
+  <div class="chips">
+   <span class="chip" id="c-bot"><span class="dot"></span>内核</span>
+   <span class="chip" id="c-qq"><span class="dot"></span>QQ</span>
+   <span class="chip" id="c-key"><span class="dot"></span>Key</span>
+  </div>
+ </div>
+
+ <!-- 总览 -->
+ <div class="page on" id="pg-home">
+  <div class="grid">
+   <div class="stat"><div class="t">机器人内核</div><div class="v" id="s-bot">…</div></div>
+   <div class="stat"><div class="t">QQ 连接</div><div class="v" id="s-qq">…</div></div>
+   <div class="stat"><div class="t">当前人设</div><div class="v" id="s-persona" style="color:var(--acc)">…</div></div>
+   <div class="stat"><div class="t">记忆会话</div><div class="v" id="s-mem">…</div></div>
+  </div>
+  <div class="card" style="margin-top:16px">
+   <h3>🚀 快速开始</h3>
+   <div class="desc">四步点亮，全绿即可用主号加小号好友开聊</div>
+   <div class="step" id="st-1"><div class="n">1</div><div>填 DeepSeek API Key —— <a href="#" onclick="nav('model');return false" style="color:var(--acc)">去模型配置</a></div></div>
+   <div class="step" id="st-2"><div class="n">2</div><div>启动机器人内核</div></div>
+   <div class="step" id="st-3"><div class="n">3</div><div>启动 QQ 协议端并扫码 —— <a href="#" onclick="nav('run');return false" style="color:var(--acc)">去运行控制</a></div></div>
+   <div class="step" id="st-4"><div class="n">4</div><div>QQ 连接成功，开聊！</div></div>
+   <div class="row"><button class="green" onclick="oneClick()">⚡ 一键启动（内核 + 协议端）</button></div>
+  </div>
+ </div>
+
+ <!-- 模型配置 -->
+ <div class="page" id="pg-model">
+  <div class="card">
+   <h3>🧠 模型提供商</h3>
+   <div class="desc">点一下自动填好地址和推荐模型（学习 AstrBot「模型提供商」页的做法）</div>
+   <div class="provs" id="provs"></div>
+   <div class="tip" id="live-prov" style="margin-top:10px"></div>
+   <label>Base URL</label><input id="f-base" placeholder="https://api.deepseek.com">
+   <label>API Key</label><input id="f-key" placeholder="sk-…（Ollama 本地随便填非空）" type="password">
+   <label>模型</label><input id="f-model" placeholder="deepseek-chat">
+   <div class="row">
+    <button class="green" onclick="saveCfg()">💾 保存并重启机器人</button>
+    <button class="ghost" onclick="testApi()">🔌 测试连通</button>
+   </div>
+   <div class="msg" id="cfg-msg"></div>
+  </div>
+  <div class="card">
+   <h3>👤 QQ 账号与权限</h3>
+   <div class="desc">扫码登录后系统自动识别并回填实际登录的 QQ 号，不用手动改</div>
+   <label>机器人 QQ 小号</label><input id="f-account" placeholder="小号QQ号">
+   <label>小号 QQ 密码（可选）<span id="pass-state" style="color:var(--acc)"></span></label>
+   <input id="f-pass" type="password" placeholder="填了就免扫码自动登录；留空=扫码登录">
+   <label>管理员 QQ（你的主号，也可在 QQ 里对机器人发「我是主人」认领）</label>
+   <input id="f-su" placeholder="主号QQ号">
+   <div class="tip" id="adopt-tip"></div>
+   <div class="tip" id="claim-code"></div>
+   <div class="tip">
+    👑 <b>管理员特权</b>：切换人设 · 修改人设 · 查看状态与Key · 设置其他管理员<br>
+    👥 <b>所有人可用</b>：私聊/群@聊天 · 重置自己的记忆 · 人设列表 · 帮助
+   </div>
+   <div class="row">
+    <button class="green" onclick="saveCfg()">💾 保存</button>
+    <button class="ghost" onclick="adoptQq()">📥 采用登录账号</button>
+   </div>
+   <div class="msg" id="qq-msg"></div>
+  </div>
+ </div>
+
+ <!-- 人设管理 -->
+ <div class="page" id="pg-persona">
+  <div class="card">
+   <h3>🎭 人设库</h3>
+   <div class="desc">点击选中编辑，⭐ 为当前生效人设；设计参考 AstrBot 多人格 + 角色卡 V2（出处见 README）</div>
+   <div class="p-list" id="p-list"></div>
+   <div class="row">
+    <button onclick="newPersona()">＋ 新建人设</button>
+    <button class="green" id="p-use" onclick="usePersona()">⭐ 设为当前</button>
+   </div>
+  </div>
+  <div class="card">
+   <h3>📝 人设源码编辑 <span style="font-weight:400;font-size:12px;color:var(--mut)" id="p-editing"></span></h3>
+   <div class="desc"># 名称 / # 防越狱: 关 写在最上面；[人设] 描述 · [示例] 对话示范 · [开场白] 加好友第一句话</div>
+   <textarea id="p-raw" style="height:300px;font-family:Consolas,monospace;font-size:13px"></textarea>
+   <div class="row">
+    <button class="green" onclick="savePersona()">💾 保存人设</button>
+    <button class="red" id="p-del" onclick="delPersona()">🗑 删除</button>
+   </div>
+   <div class="msg" id="p-msg"></div>
+  </div>
+ </div>
+
+ <!-- 插件 -->
+ <div class="page" id="pg-plugin">
+  <div class="card">
+   <h3>🧩 内置插件</h3>
+   <div class="desc">按需开关，保存即生效（不用重启）。列表：名字 | 说明 | 开关</div>
+   <div id="pl-builtin">加载中…</div>
+  </div>
+  <div class="card">
+   <h3>🛒 插件市场（精选自 NoneBot 生态）</h3>
+   <div class="desc">点安装会自动下载并启用（可能要一两分钟），完成后内核自动重启——QQ 登录不受影响。
+    装前建议先看各插件文档；
+    <a href="https://nonebot.dev/store/plugins" target="_blank" style="color:var(--acc)">浏览完整官方商店 →</a></div>
+   <div id="pl-market">加载中…</div>
+   <div class="msg" id="pl-msg"></div>
+  </div>
+  <div class="card">
+   <h3>📦 已安装的第三方插件</h3>
+   <div id="pl-installed">加载中…</div>
+  </div>
+ </div>
+
+ <!-- 运行控制 -->
+ <div class="page" id="pg-run">
+  <div class="card">
+   <h3>⚙️ 机器人内核（NoneBot2 · 端口 8081）</h3>
+   <div class="desc" id="run-bot-state">状态加载中…</div>
+   <div class="row">
+    <button class="green" id="b-bs" onclick="api('bot/start',event)">▶ 启动</button>
+    <button class="red" id="b-bx" onclick="api('bot/stop',event)">⏹ 停止</button>
+    <button class="ghost" onclick="window.open('http://127.0.0.1:8081/healthz')">healthz</button>
+   </div>
+  </div>
+  <div class="card">
+   <h3>🐧 QQ 协议端（NapCat · 随包内置）</h3>
+   <div class="desc" id="run-nc-state">状态加载中…</div>
+   <div class="row">
+    <button class="green" id="b-ns" onclick="api('napcat/start',event)">▶ 启动</button>
+    <button class="red" id="b-nx" onclick="api('napcat/stop',event)">⏹ 停止</button>
+    <button class="ghost" onclick="refreshQr()">🔄 刷新二维码</button>
+   </div>
+   <img id="qr" src="/api/qrcode" alt="登录二维码">
+   <div class="tip" id="qr-tip"></div>
+   <div class="tip">提示：协议端与内核是两个进程，都要运行；不要和其他机器人同时登录同一个 QQ 号（互踢）。</div>
+  </div>
+ </div>
+
+ <!-- 日志 -->
+ <div class="page" id="pg-log">
+  <div class="card"><h3>📜 内核日志</h3><pre id="log-kernel">加载中…</pre></div>
+  <div class="card"><h3>🐧 协议端日志</h3><pre id="log-napcat">加载中…</pre></div>
+ </div>
+</div>
+
+<script>
+const $=id=>document.getElementById(id);
+
+/* ---------- 全局按钮反馈：任何按钮点击都有toast+按压缩放 ---------- */
+function showToast(t){const e=$('toast');e.textContent=t;e.classList.add('show');
+ clearTimeout(showToast._t);showToast._t=setTimeout(()=>e.classList.remove('show'),1800)}
+document.addEventListener('click',e=>{const b=e.target.closest('button');
+ if(b&&!b.disabled)showToast('✅ 已执行：'+(b.textContent.trim()||'操作'))});
+
+let PRESETS={},PROFILES={},curProv='',liveProv='';
+
+/* ---------- 导航 ---------- */
+const TITLES={home:'总览',model:'模型配置',persona:'人设管理',plugin:'插件',run:'运行控制',log:'运行日志'};
+function nav(p){document.querySelectorAll('.nav').forEach(e=>e.classList.toggle('on',e.dataset.p===p));
+ document.querySelectorAll('.page').forEach(e=>e.classList.toggle('on',e.id==='pg-'+p));
+ $('page-title').textContent=TITLES[p]}
+
+/* ---------- 状态 ---------- */
+let S={bot_running:false,napcat_running:false,qq_connected:false,api_key_set:false};
+function chip(id,on,txt){const e=$(id);e.classList.toggle('on',on);e.classList.toggle('err',!on&&txt!=''&&id==='c-key');
+ e.childNodes[1].textContent=txt}
+let lastQQ=false;
+async function refresh(){
+ try{
+  S=await(await fetch('/api/status')).json();
+  chip('c-bot',S.bot_running,'内核 '+(S.bot_running?'运行中':'停止'));
+  chip('c-qq',S.qq_connected,'QQ '+(S.qq_connected?'已连接':'未连接'));
+  chip('c-key',S.api_key_set,'Key '+(S.api_key_set?'已填':'未填'));
+  $('s-bot').textContent=S.bot_running?'● 运行中':'○ 已停止';
+  $('s-bot').className='v '+(S.bot_running?'run':'stop');
+  $('s-qq').textContent=S.qq_connected
+    ?('● 已登录 '+(S.logged_in_qq||'')):'○ 未连接';
+  $('s-qq').className='v '+(S.qq_connected?'run':'stop');
+  if(S.logged_in_qq&&S.logged_in_qq!==$('f-account').value)
+   $('adopt-tip').textContent='检测到实际登录账号：'+S.logged_in_qq+'（与配置不同，点下方「采用」同步）';
+  else if(S.logged_in_qq)
+   $('adopt-tip').textContent='实际登录账号：'+S.logged_in_qq+'（与配置一致 ✓）';
+  else $('adopt-tip').textContent='';
+  $('claim-code').textContent=S.claim_code
+   ?('🔑 管理员认领码：'+S.claim_code+'（用主号私聊机器人发「我是主人 '+S.claim_code+'」）')
+   :'管理员已认领（或首次启动内核后生成认领码）';
+  if(S.qq_connected&&!lastQQ)
+   showToast('🎉 QQ 登录成功'+(S.logged_in_qq?('：'+S.logged_in_qq):'')+'，可以开聊了');
+  lastQQ=S.qq_connected;
+  $('s-mem').textContent=(S.memory_sessions??0)+' 个';
+  step('st-1',S.api_key_set);step('st-2',S.bot_running);
+  step('st-3',S.napcat_running);step('st-4',S.qq_connected);
+  $('b-bs').disabled=S.bot_running;$('b-bx').disabled=!S.bot_running;
+  $('b-ns').disabled=S.napcat_running;$('b-nx').disabled=!S.napcat_running;
+  $('run-bot-state').textContent=S.bot_running?'✅ 运行中（PID 监听 127.0.0.1:8081）':'⏹ 已停止';
+  $('run-nc-state').textContent=S.napcat_running?(S.qq_connected?'✅ 运行中 · QQ 已登录':'🟡 运行中 · 等待扫码'):'⏹ 已停止';
+  const showQr=S.napcat_running&&!S.qq_connected;
+  $('qr').style.display=showQr?'block':'none';
+  if(showQr){
+   const left=Math.max(0,Math.round((qrDeadline-Date.now())/1000));
+   $('qr').src='/api/qrcode?t='+Date.now();
+   $('qr-tip').textContent=qrDeadline>0
+     ?(left>0?`⏳ 等待扫码…（约 ${left}s 后过期，过期后点「🔄 刷新二维码」；扫码后手机上要点「授权登录」）`
+             :'二维码已过期，点「🔄 刷新二维码」生成新的')
+     :'等待二维码生成…';
+  }else $('qr-tip').textContent=S.qq_connected?'✅ QQ 已登录，二维码已隐藏':'';
+  $('foot-dot').style.background=(S.bot_running&&S.qq_connected)?'#22c55e':(S.bot_running?'#eab308':'#94a3b8');
+  $('foot-txt').textContent=S.qq_connected?'一切正常':(S.bot_running?'等待 QQ 连接':'机器人离线');
+ }catch(e){}}
+function step(id,done){$(id).classList.toggle('done',done);
+ $(id).querySelector('.n').textContent=done?'✓':id.slice(-1)}
+async function oneClick(){await fetch('/api/bot/start',{method:'POST',
+  headers:{'Content-Type':'application/json'},body:'{}'});
+ await fetch('/api/napcat/start',{method:'POST',
+  headers:{'Content-Type':'application/json'},body:'{}'});setTimeout(refresh,800)}
+
+/* ---------- 模型配置 ---------- */
+let cfgDirty=false;   // 选过提供商或改过表单 = 编辑中，任何自动刷新都不得回填
+['f-base','f-key','f-model','f-account','f-su'].forEach(id=>
+ $(id).addEventListener('input',()=>{cfgDirty=true}));
+let maskedKey='';   // 服务端只回掩码：输入框=掩码或空 → 保存时不修改已存 Key
+async function loadCfg(force){
+ if(!force&&(cfgDirty||formFocused()))return;
+ const c=await(await fetch('/api/config')).json();
+ $('f-base').value=c.base_url;maskedKey=c.api_key||'';$('f-key').value=maskedKey;
+ $('f-model').value=c.model;
+ $('f-account').value=c.napcat_account;$('f-su').value=c.superuser;
+ $('pass-state').textContent=c.napcat_password_set?'（已设置，免扫码）':'';
+ $('s-persona').textContent=c.persona_name||'-';
+ liveProv=c.live_provider||'自定义';
+ if(!cfgDirty)curProv=liveProv;
+ $('live-prov').textContent='● 当前生效：'+liveProv+'（'+c.model+'）';
+ renderProvs()}
+function formFocused(){return ['f-base','f-key','f-model','f-account','f-su']
+ .some(id=>document.activeElement===$(id))}
+async function pollPersonaName(){   // 周期任务只刷总览人设名，绝不碰表单和提供商高亮
+ try{const c=await(await fetch('/api/config')).json();
+  $('s-persona').textContent=c.persona_name||'-'}catch(e){}}
+async function loadProviders(){
+ const d=await(await fetch('/api/providers')).json();
+ PRESETS=d.presets||{};PROFILES=d.saved||{}}
+function fillProvider(k){   // 切换提供商=加载它自己的档案；Key 各存各的，绝不串槽
+ curProv=k;cfgDirty=true;
+ const saved=PROFILES[k]||{},preset=PRESETS[k]||{};
+ $('f-base').value=saved.base_url||preset.base_url||'';
+ $('f-model').value=saved.model||preset.model||'';
+ $('f-key').value=saved.api_key||'';
+ renderProvs()}
+function renderProvs(){const box=$('provs');box.innerHTML='';
+ Object.keys(PRESETS).forEach(k=>{const d=document.createElement('div');
+  d.className='prov'+(k===curProv?' on':'');
+  d.textContent=k+(k===liveProv?' ●':'');
+  d.title=k===liveProv?'当前生效':'点击载入该提供商的档案';
+  d.onclick=()=>fillProvider(k);box.appendChild(d)})}
+async function saveCfg(){
+ msg('cfg-msg','保存中…','');
+ const body={provider:curProv,base_url:$('f-base').value,model:$('f-model').value,
+  napcat_account:$('f-account').value,superuser:$('f-su').value};
+ const k=$('f-key').value;
+ if(k&&k!==maskedKey)body.api_key=k;          // 掩码/空=不修改已存 Key
+ if($('f-pass').value)body.napcat_password=$('f-pass').value;
+ const r=await fetch('/api/save',{method:'POST',headers:{'Content-Type':'application/json'},
+  body:JSON.stringify(body)});
+ const j=await r.json();
+ const m=j.ok?('✅ 已保存'+(j.bot_restarted?'，机器人已重启生效':'（机器人未运行，下次启动生效）')):'❌ '+(j.error||'保存失败');
+ msg('cfg-msg',m,j.ok?'ok':'err');msg('qq-msg',m,j.ok?'ok':'err');
+ if(j.ok){cfgDirty=false;
+  if(curProv)PROFILES[curProv]={base_url:$('f-base').value,api_key:$('f-key').value,
+   model:$('f-model').value};
+  loadCfg(true)}}   // 保存成功后才回填并同步提供商高亮
+async function testApi(){
+ msg('cfg-msg','正在调用模型测试…','');
+ const body={base_url:$('f-base').value,model:$('f-model').value};
+ const k=$('f-key').value;
+ if(k&&k!==maskedKey)body.api_key=k;
+ const j=await(await fetch('/api/test',{method:'POST',headers:{'Content-Type':'application/json'},
+  body:JSON.stringify(body)})).json();
+ if(j.ok)msg('cfg-msg',`✅ 连通正常（${j.latency_ms}ms）回复：${j.reply}`,'ok');
+ else msg('cfg-msg','❌ '+(j.error||'调用失败'),'err')}
+function msg(id,text,cls){const e=$(id);e.textContent=text;e.className='msg '+(cls||'')}
+
+/* ---------- 人设管理 ---------- */
+let P={active:'',personas:{}},selP='';
+async function loadPersonas(){P=await(await fetch('/api/personas')).json();
+ if(!P.personas[P.active])P.active=Object.keys(P.personas)[0]||'';
+ if(!selP||!P.personas[selP])selP=P.active;
+ renderPersonas()}
+function renderPersonas(){const box=$('p-list');box.innerHTML='';
+ Object.keys(P.personas).sort().forEach(name=>{const d=document.createElement('div');
+  d.className='p-item'+(name===P.active?' on':'');
+  const isActive=name===P.active,isSel=name===selP;
+  if(isSel&&!isActive)d.style.outline='2px solid #93c5fd';
+  // 头像：名字首字 + 名字哈希取色渐变（同一人设颜色恒定）
+  const av=document.createElement('div');av.className='p-avatar';
+  av.textContent=[...name][0]||'?';
+  const hue=[...name].reduce((a,c)=>a+c.codePointAt(0),0)%360;
+  av.style.background=`linear-gradient(135deg,hsl(${hue} 72% 55%),hsl(${(hue+45)%360} 72% 42%))`;
+  const body=document.createElement('div');body.className='body';
+  // 人设名是不可信输入：一律 textContent，禁止 innerHTML 拼接（评审 P0-2）
+  const nm=document.createElement('div');nm.className='nm';
+  const nmText=document.createElement('span');nmText.textContent=name;nm.append(nmText);
+  if(isActive){const b=document.createElement('span');b.className='p-badge';
+   b.textContent='当前';nm.append(b)}
+  // 开场白预览（从人设源码里抽 [开场白] 第一句）
+  const greet=document.createElement('div');greet.className='p-greet';
+  const gm=(P.personas[name].match(/\[开场白\]\s*\r?\n(.+)/)||[])[1]||'';
+  greet.textContent=gm?('“'+gm.trim().slice(0,26)+'”'):'（无开场白）';
+  const tag=document.createElement('div');tag.className='tag';
+  tag.textContent=isSel?'✏️ 编辑中':'点击编辑';
+  body.append(nm,greet,tag);
+  d.append(av,body);
+  d.onclick=()=>{selP=name;$('p-raw').value=P.personas[name];renderPersonas()};
+  box.appendChild(d)});
+ $('p-editing').textContent=selP?('—— '+selP+(selP===P.active?'（当前生效）':'')):'';
+ $('p-raw').value=P.personas[selP]||'';
+ $('p-del').disabled=!selP||Object.keys(P.personas).length<=1;
+ $('p-use').disabled=!selP||selP===P.active}
+async function usePersona(){if(!selP)return;
+ const j=await(await fetch('/api/persona/switch',{method:'POST',
+  headers:{'Content-Type':'application/json'},body:JSON.stringify({name:selP})})).json();
+ msg('p-msg',j.ok?`✅ 已切换为「${selP}」，立即生效`:'❌ '+(j.error||'切换失败'),j.ok?'ok':'err');
+ await loadPersonas();loadCfg()}
+async function savePersona(){if(!selP)return;
+ const j=await(await fetch('/api/persona/save',{method:'POST',
+  headers:{'Content-Type':'application/json'},
+  body:JSON.stringify({name:selP,raw:$('p-raw').value})})).json();
+ msg('p-msg',j.ok?'✅ 已保存'+(selP===P.active?'（当前人设，立即生效）':''):'❌ '+(j.error||'保存失败'),j.ok?'ok':'err');
+ await loadPersonas()}
+async function newPersona(){
+ const name=prompt('新人设名称（比如：温柔学姐）');
+ if(!name)return;
+ const tpl=`# 名称: ${name}\n# 出处: 自建\n\n[人设]\n你是${name}，用一句话描述性格和说话风格\n\n[示例]\n用户: 你好\n你: （按人设口吻回一句）\n\n[开场白]\n（别人加好友后主动发的第一句话）\n`;
+ const j=await(await fetch('/api/persona/save',{method:'POST',
+  headers:{'Content-Type':'application/json'},body:JSON.stringify({name:name,raw:tpl})})).json();
+ if(j.ok){selP=j.name||name;await loadPersonas();msg('p-msg','✅ 已创建，编辑后点保存','ok')}
+ else msg('p-msg','❌ '+(j.error||'创建失败'),'err')}
+async function delPersona(){if(!selP||Object.keys(P.personas).length<=1)return;
+ if(!confirm(`确定删除人设「${selP}」？`))return;
+ const j=await(await fetch('/api/persona/delete',{method:'POST',
+  headers:{'Content-Type':'application/json'},body:JSON.stringify({name:selP})})).json();
+ msg('p-msg',j.ok?'🗑 已删除':'❌ '+(j.error||'删除失败'),j.ok?'ok':'err');
+ await loadPersonas();loadCfg()}
+
+/* ---------- 通用 ---------- */
+async function api(path,ev){const b=ev&&ev.target?ev.target.closest('button'):null;
+ if(b)b.disabled=true;   // 指令执行期间禁用按钮，防连点
+ await fetch('/api/'+path,{method:'POST',headers:{'Content-Type':'application/json'},body:'{}'});
+ setTimeout(refresh,700)}
+
+/* 二维码有效期约 2 分钟：成功加载才起倒计时；404(旧图被服务端拦下)视为过期 */
+let qrDeadline=0;
+$('qr').onload=()=>{qrDeadline=Date.now()+110000};
+$('qr').onerror=()=>{qrDeadline=0};
+async function refreshQr(){
+ $('qr-tip').textContent='正在重启协议端生成新二维码…';
+ await fetch('/api/napcat/stop',{method:'POST',
+  headers:{'Content-Type':'application/json'},body:'{}'});
+ setTimeout(()=>fetch('/api/napcat/start',{method:'POST',
+  headers:{'Content-Type':'application/json'},body:'{}'}),2000);
+ setTimeout(refresh,4000)}
+async function loadLogs(){try{const j=await(await fetch('/api/logs')).json();
+ const k=$('log-kernel'),n=$('log-napcat');
+ k.textContent=j.kernel;n.textContent=j.napcat;
+ k.scrollTop=k.scrollHeight;n.scrollTop=n.scrollHeight}catch(e){}}
+
+async function adoptQq(){
+ if(!S.logged_in_qq){msg('qq-msg','还没有检测到已登录的账号','err');return}
+ const j=await(await fetch('/api/account/adopt',{method:'POST',
+  headers:{'Content-Type':'application/json'},
+  body:JSON.stringify({qq:S.logged_in_qq})})).json();
+ msg('qq-msg',j.ok?('✅ 已把配置账号采用为 '+j.qq):'❌ '+(j.error||'失败'),j.ok?'ok':'err');
+ if(j.ok){$('f-account').value=j.qq;refresh()}}
+
+/* ---------- 插件中心 ---------- */
+let PL={builtin:[],market:[],installed:[]};
+async function loadPlugins(){
+ try{PL=await(await fetch('/api/plugins')).json();renderPlugins()}catch(e){}}
+function plRow(box,item){const row=document.createElement('div');row.className='pl-item';
+ const left=document.createElement('div');
+ const nm=document.createElement('div');nm.className='nm';
+ nm.textContent=item.name||item.pip;
+ if(item.cat){const c=document.createElement('span');c.className='cat';c.textContent=item.cat;nm.append(c)}
+ const ds=document.createElement('div');ds.className='ds';ds.textContent=item.desc||'';
+ left.append(nm,ds);row.append(left);return row}
+function renderPlugins(){
+ const b=$('pl-builtin');b.innerHTML='';
+ PL.builtin.forEach(p=>{const row=plRow(b,p);
+  const btn=document.createElement('button');
+  btn.className=p.enabled?'green':'ghost';
+  btn.textContent=p.enabled?'已开启 ✓ 点一下关闭':'已关闭 · 点一下开启';
+  btn.onclick=()=>togglePlugin(p.id,!p.enabled);row.append(btn);b.append(row)});
+ const m=$('pl-market');m.innerHTML='';
+ const installed=new Set(PL.installed.map(x=>x.pip));
+ const enabledBuiltin=new Set(PL.builtin.filter(x=>x.enabled).map(x=>x.id));
+ PL.market.filter(p=>!installed.has(p.pip)
+   &&!(p.type==='local'&&enabledBuiltin.has(p.id))).forEach(p=>{
+  const row=plRow(m,p);
+  const btn=document.createElement('button');btn.textContent='⬇ 安装';
+  btn.onclick=()=>installPlugin(p.pip);row.append(btn);m.append(row)});
+ if(!m.children.length)m.textContent='市场里的都装上了，去官方商店逛逛吧～';
+ const i=$('pl-installed');i.innerHTML='';
+ if(!PL.installed.length){i.textContent='（还没装第三方插件）'}
+ PL.installed.forEach(p=>{const row=plRow(i,{name:p.name,pip:p.pip,
+   desc:p.pip});
+  const btns=document.createElement('div');btns.className='pl-btns';
+  const tg=document.createElement('button');
+  tg.className=p.enabled?'green':'ghost';tg.textContent=p.enabled?'已启用':'已停用';
+  tg.onclick=()=>togglePlugin(p.pip,!p.enabled);
+  const rm=document.createElement('button');rm.className='red';rm.textContent='卸载';
+  rm.onclick=()=>uninstallPlugin(p.pip);
+  btns.append(tg,rm);row.append(btns);i.append(row)})}
+async function togglePlugin(id,en){
+ await fetch('/api/plugin/toggle',{method:'POST',
+  headers:{'Content-Type':'application/json'},body:JSON.stringify({id:id,enabled:en})});
+ loadPlugins()}
+async function installPlugin(pip){
+ msg('pl-msg','⏳ 正在下载安装 '+pip+'（可能要一两分钟，别关页面）…','');
+ const j=await(await fetch('/api/plugin/install',{method:'POST',
+  headers:{'Content-Type':'application/json'},body:JSON.stringify({pip:pip})})).json();
+ msg('pl-msg',j.ok?('✅ 安装成功'+(j.restarted?'，内核已重启加载（QQ 不受影响）':'（内核未运行，下次启动生效）'))
+   :'❌ '+(j.error||'安装失败'),j.ok?'ok':'err');
+ loadPlugins()}
+async function uninstallPlugin(pip){
+ if(!confirm('确定卸载 '+pip+' ？'))return;
+ msg('pl-msg','⏳ 卸载中…','');
+ const j=await(await fetch('/api/plugin/uninstall',{method:'POST',
+  headers:{'Content-Type':'application/json'},body:JSON.stringify({pip:pip})})).json();
+ msg('pl-msg',j.ok?'🗑 已卸载':'❌ '+(j.error||'卸载失败'),j.ok?'ok':'err');
+ loadPlugins()}
+
+loadProviders().then(()=>loadCfg(true));loadPersonas();loadPlugins();refresh();loadLogs();
+setInterval(refresh,3000);setInterval(loadLogs,5000);setInterval(pollPersonaName,15000);
+</script><div id="toast"></div>
+</body></html>
