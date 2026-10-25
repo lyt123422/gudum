@@ -174,7 +174,7 @@ pre{background:#0f172a;color:#bbf7d0;font-size:12px;padding:14px;border-radius:1
    <label>机器人 QQ 小号</label><input id="f-account" placeholder="小号QQ号">
    <label>小号 QQ 密码（可选）<span id="pass-state" style="color:var(--acc)"></span></label>
    <input id="f-pass" type="password" placeholder="填了就免扫码自动登录；留空=扫码登录">
-   <label>管理员 QQ（你的主号，也可在 QQ 里对机器人发「我是主人」认领）</label>
+   <label>管理员 QQ（你的主号，也可在 QQ 里发「我是主人 &lt;认领码&gt;」认领）</label>
    <input id="f-su" placeholder="主号QQ号">
    <div class="tip" id="adopt-tip"></div>
    <div class="tip" id="claim-code"></div>
@@ -325,22 +325,33 @@ pre{background:#0f172a;color:#bbf7d0;font-size:12px;padding:14px;border-radius:1
   <div class="card">
    <h3>🔀 反代 · WorkBuddy 网关</h3>
    <div class="desc" id="px-state">状态加载中…</div>
+   <div class="tip">每个用户都在自己电脑上跑自己的 WorkBuddy：首次点「🌐 登录 WorkBuddy」，没安装会自动下载 WorkBuddy-Hub 到 <code>data/workbuddy-hub</code>（约 10 MB，SHA256 校验），启动后打开看板；点「+ 添加账号 (OAuth)」登录你自己的账号，检测到账号就绪会自动接入。不需要填写任何人的服务器地址。</div>
    <div class="row">
-    <button class="green" id="px-start" onclick="pxStart()">🚀 启动并接入</button>
+    <button class="green" id="px-start" onclick="pxStart()">🔎 检测并接入</button>
+    <button class="green" onclick="pxLogin()">🌐 登录 WorkBuddy</button>
     <button class="red" id="px-stop" onclick="pxStop()">⏹ 停止并切回直连</button>
-    <button class="ghost" onclick="window.open('http://127.0.0.1:8788/','_blank')">📊 WorkBuddy 看板</button>
+    <button class="ghost" onclick="window.open('http://127.0.0.1:'+((PX.config&&PX.config.port)||8788)+'/','_blank')">📊 WorkBuddy 看板</button>
+    <button class="ghost" id="px-install" onclick="pxInstall()">⬇️ 安装 WorkBuddy-Hub</button>
    </div>
    <div class="msg" id="px-msg"></div>
+   <div class="tip">WorkBuddy-Hub 是第三方 MIT 项目，由官方 GitHub Release 提供；登录的账号、Key 和额度都只在你本机。</div>
   </div>
   <div class="card">
    <h3>⚙️ 设置</h3>
-   <label>WorkBuddy 路径（含 wb_proxy.py）</label><input id="px-path">
-   <label>端口</label><input id="px-port">
    <label>模型（启动后从 /v1/models 拉取，也可手动填）</label>
-   <select id="px-model" onchange="applyProxyModel()"></select>
-   <input id="px-model-manual" placeholder="或手动填模型名" style="margin-top:8px">
+   <select id="px-model" onchange="$('px-model-manual').value='';applyProxyModel()"></select>
+   <div class="row" style="margin-top:8px">
+    <input id="px-model-manual" placeholder="或手动填精确模型 ID，如 deepseek-v4.1-flash"
+           onkeydown="if(event.key==='Enter')applyProxyModel()">
+    <button class="ghost" onclick="applyProxyModel()">应用模型</button>
+   </div>
    <label>API Key（留空 = 自动读 WorkBuddy 的 settings.json）</label>
    <input id="px-key" type="password" placeholder="自动读取">
+   <details style="margin-top:10px">
+    <summary style="cursor:pointer;color:var(--mut);font-size:12.5px">高级：已有安装路径 / 端口（一般不用填）</summary>
+    <label>已有 WorkBuddy-Hub 路径（含 wb_proxy.py，可留空）</label><input id="px-path" placeholder="留空 = 自动下载到 data/workbuddy-hub">
+    <label>端口</label><input id="px-port" placeholder="8788">
+   </details>
    <div class="row"><button class="green" onclick="saveProxyCfg()">💾 保存设置</button></div>
    <div class="tip">模型源与直连互斥：反代接入后，模型配置页的直连保存只存档不激活；停止反代自动切回。</div>
   </div>
@@ -356,6 +367,7 @@ pre{background:#0f172a;color:#bbf7d0;font-size:12px;padding:14px;border-radius:1
     <div class="step"><div class="n">3</div><div><b>认领管理员</b> —— 用主号私聊机器人：<b>我是主人 认领码</b>（认领码见下方认领码提示；10 分钟有效）→ 收到「✅ 你已成为管理员」。不认领：换人设/看状态/抖音都用不了</div></div>
     <div class="step"><div class="n">4</div><div><b>开聊</b> —— 主号加小号好友，私聊直接发消息；群里 <b>@机器人</b> 或 <b>/命令</b>；发 <b>帮助</b> 看完整菜单</div></div>
     <div class="tip">⚠ 只用小号（协议端有风控风险）；数据都在本机；面板不要暴露到公网。</div>
+    <div class="tip">🔀 用 WorkBuddy 反代：先去「🔀 反代」启动并接入，再在反代页选精确模型 ID（如 <code>deepseek-v4.1-flash</code>）；不要在「🧠 模型配置」里直连切换反代模型。</div>
   </div>
 
   <div class="card">
@@ -373,6 +385,8 @@ pre{background:#0f172a;color:#bbf7d0;font-size:12px;padding:14px;border-radius:1
     <div class="desc">🧩 插件页：上半是内置开关（即点即生效），下半是市场（点 ⬇ 自动装依赖）</div>
     <div class="tip">· 联网 / 语音 / 表情包：默认开，零配置<br>
       · 抖音真机：市场安装 → 手机开 USB 调试连电脑 → QQ 发「连接手机」<br>
+      · 定时任务：内置默认开，在「⏰ 定时任务」页配置（不是市场插件）<br>
+      · 反代：独立页，不是插件；按「🔀 反代」页说明接入 WorkBuddy<br>
       · 第三方插件装完内核自动重启（QQ 不受影响）；内核没开则提示"下次启动生效"<br>
       · ⚠ 对话类第三方插件会和内置聊天抢消息，二选一</div>
   </div>
@@ -391,11 +405,41 @@ pre{background:#0f172a;color:#bbf7d0;font-size:12px;padding:14px;border-radius:1
   </div>
 
   <div class="card">
+    <h3>🔀 反代（WorkBuddy 网关）</h3>
+    <div class="desc">每个用户在自己电脑上跑自己的 WorkBuddy-Hub，登录自己的 WorkBuddy 账号；不经过作者或他人的服务器。</div>
+    <div class="tip">
+      <b>首次</b>：点「🌐 登录 WorkBuddy」；如果没装 WorkBuddy-Hub，面板会自动从官方 GitHub Release 下载到 <code>data/workbuddy-hub</code>（约 10 MB，SHA256 校验）并启动。<br>
+      <b>登录</b>：打开看板 →「+ 添加账号 (OAuth)」→ 浏览器登录（国际版/国内版），账号自动入库；检测到账号就绪会自动接入，也可回来点「🔎 检测并接入」。看板密码默认 <code>admin</code>，首次登录后建议改掉。<br>
+      <b>接入</b>：健康检查通过后自动拉模型、写模型源、重启内核；已有安装时不用填路径/端口。<br>
+      <b>换模型</b>：在「模型」下拉里选精确 ID（如 <code>deepseek-v4.1-flash</code>），或手动输入后点「应用模型」/回车；换模型会重启内核。<br>
+      <b>切回</b>：点「⏹ 停止并切回直连」，恢复启动前的直连模型并重启内核。
+    </div>
+    <div class="tip">⚠ 模型名必须用 <code>/v1/models</code> 的精确 ID：是 <code>deepseek-v4.1-flash</code>，不是 <code>deepseek4.1flash</code>。<br>
+      ⚠ 反代激活时，「🧠 模型配置」里的直连保存只存档案、不激活；要换反代模型必须在「🔀 反代」页操作。<br>
+      ⚠ 已有 WorkBuddy-Hub 放在别的盘：在「高级」里填含 <code>wb_proxy.py</code> 的目录；离线安装可把发布包放到 <code>data/workbuddy-hub.zip</code>。<br>
+      ⚠ 显示“外部启动”时面板停不掉它；请去 WorkBuddy 看板/任务管理器停止。启动失败看 <code>data/proxy.log</code>。</div>
+  </div>
+
+  <div class="card">
+    <h3>⏰ 定时任务（管理员）</h3>
+    <div class="desc">面板配 cron + 内容，到点自动往指定群/好友发消息；QQ 里也能配。</div>
+    <div class="tip">
+      <b>面板</b>：⏰ 定时任务 → 填名称 / cron / 内容 / 目标（群号，或 <code>friend:QQ号</code>）→ 保存；同名保存=更新，列表里可开关/编辑/删除。<br>
+      <b>先测</b>：QQ 发 <code>定时任务 立即 名字</code>，确认能发出去再等 cron。<br>
+      <b>cron</b>：五段「分 时 日 月 周」，例：<code>0 9 * * 1-5</code>=工作日 9:00；<code>*/30 * * * *</code>=每 30 分钟；<code>30 8 * * *</code>=每天 8:30；周字段 0=周日。<br>
+      <b>QQ</b>：<code>定时任务 添加 名字 | cron | 内容 | 群号</code>（好友用 <code>friend:QQ</code>）· <code>定时任务 列表/删除/开启/关闭/立即 名字</code>
+    </div>
+    <div class="tip">⚠ 群聊命令需 @ 或 <code>/</code> 前缀；单条内容 ≤500 字、最多 50 个任务。<br>
+      ⚠ 依赖内核运行：内核/插件关闭时不发，面板会显示调度器状态；停机期间错过的任务不会补发。<br>
+      ⚠ 发送失败会记录在列表，不保证同一分钟重试；先「立即」测好群号/好友号。</div>
+  </div>
+
+  <div class="card">
     <h3>🩺 不回话？三步排查</h3>
     <div class="step"><div class="n">1</div><div><b>Key 灯</b>没绿 → 模型配置测试连通：401=Key 错 · 402=余额不足 · 404=模型名错</div></div>
     <div class="step"><div class="n">2</div><div><b>QQ 灯</b>没绿 → 重启协议端刷新二维码重扫；互踢=两个程序登同一号</div></div>
     <div class="step"><div class="n">3</div><div>都绿不回 → 看 📜 运行日志末尾；"发送被QQ拦截"=临时风控，等几分钟自动恢复</div></div>
-    <div class="tip">进阶排障/数据备份/费用说明见项目 TUTORIAL.md 第 12–13 节。</div>
+    <div class="tip">反代/定时任务专项：换模型后仍用旧模型 → 反代页重新选精确 ID（如 <code>deepseek-v4.1-flash</code>）；定时任务不发 → 先 QQ 发「定时任务 立即 名字」测发送，再看调度器状态/群号/风控。</div>
   </div>
 
   <div class="card">
@@ -846,15 +890,31 @@ async function schedToggle(name,en){
  renderSched()}
 
 /* ---------- 反代 ---------- */
-let PX={status:{},config:{},models:[]},pxBusy=false;
+let PX={status:{},config:{},models:[],accounts:0,accounts_ready:0,
+ install:{installed:false}},pxBusy=false;
+let pxLoginPending=false;
+async function pxPost(url,body){
+ return await(await fetch(url,{method:'POST',
+  headers:{'Content-Type':'application/json'},body:JSON.stringify(body||{})})).json();}
 async function loadProxy(){
  try{PX=await(await fetch('/api/proxy')).json();renderProxy()}catch(e){}}
 let pxSig='';
 function renderProxy(){
- const s=PX.status||{};
+ const s=PX.status||{},ins=PX.install||{};
+ const ready=PX.accounts_ready||0,total=PX.accounts||0;
+ const ver=ins.version?(' · WorkBuddy-Hub '+ins.version):'';
  $('px-state').textContent=s.running
-  ?('✅ 反代运行中（端口 '+s.port+(s.external?'，外部启动':'')+'）· 模型源：'+(s.active?'反代 ✅':'直连'))
-  :'⏹ 反代未运行（可在 WorkBuddy 目录手动启动，或点上方按钮）';
+  ?('✅ 反代运行中（端口 '+s.port+(s.external?'，外部启动':'')+'）· 账号 '+ready+'/'+total+' 就绪 · 模型源：'+(s.active?'反代 ✅':'直连')+ver)
+  :(ins.installed
+    ?('⏹ 反代未运行（已安装：'+(ins.path||'')+'）')
+    :'⬇️ 未检测到 WorkBuddy-Hub：点「🌐 登录 WorkBuddy」会自动下载安装（约 10 MB）');
+ const ib=$('px-install');if(ib)ib.style.display=ins.installed?'none':'';
+ // 从“登录 WorkBuddy”回来、检测到账号就绪后，自动接入一次
+ if(pxLoginPending&&s.running&&ready>0&&!s.active&&!pxBusy){
+  pxLoginPending=false;
+  msg('px-msg','✅ 检测到 WorkBuddy 账号已就绪，正在自动接入…','ok');
+  pxStart();
+ }
  const cur=PX.config.model||'';
  const sig=JSON.stringify([PX.models||[],cur]);
  if(sig!==pxSig){pxSig=sig;   // 评审 v4：数据变了才重建，不再覆盖用户正在选的模型
@@ -863,12 +923,54 @@ function renderProxy(){
   sel.innerHTML='';names.forEach(m=>{const o=document.createElement('option');
    o.value=m;o.textContent=m;if(m===cur)o.selected=true;sel.appendChild(o)});
   if(!names.length){const o=document.createElement('option');o.value='';o.textContent='（启动后自动拉取）';sel.appendChild(o)}}
- if(document.activeElement!==$('px-path'))$('px-path').value=PX.config.path||'';
+ if(document.activeElement!==$('px-path'))
+  $('px-path').value=ins.installed?(ins.path||PX.config.path||''):'';
  if(document.activeElement!==$('px-port'))$('px-port').value=PX.config.port||''}
+async function pxInstall(){
+ if(pxBusy)return;pxBusy=true;
+ msg('px-msg','⏳ 正在下载并安装 WorkBuddy-Hub（约 10 MB，首次较慢）…','');
+ try{const j=await pxPost('/api/proxy/install');
+  msg('px-msg',j.ok
+   ?('✅ WorkBuddy-Hub '+(j.version||'')+' 已就绪：'+(j.path||''))
+   :('❌ '+(j.error||'安装失败')),j.ok?'ok':'err')}
+ finally{pxBusy=false;loadProxy()}}
+async function pxLogin(){
+ if(pxBusy)return;
+ const port=(PX.config&&PX.config.port)||8788;
+ const win=window.open('about:blank','_blank');
+ if(win){try{win.document.title='WorkBuddy';win.document.body.textContent='正在准备 WorkBuddy，请稍候…'}catch(e){}}
+ pxBusy=true;
+ msg('px-msg','⏳ 正在检查 WorkBuddy-Hub…','');
+ try{
+  if(!(PX.install&&PX.install.installed)){
+   msg('px-msg','⏳ 首次使用：正在下载 WorkBuddy-Hub（约 10 MB）…','');
+   const ins=await pxPost('/api/proxy/install');
+   if(!ins.ok){msg('px-msg','❌ '+(ins.error||'安装失败'),'err');
+    if(win&&!win.closed)win.close();return}
+   await loadProxy();
+  }
+  const st=await pxPost('/api/proxy/start');
+  if(!st.ok){msg('px-msg','❌ '+(st.error||'启动失败'),'err');
+   if(win&&!win.closed)win.close();return}
+  pxLoginPending=true;
+  msg('px-msg',st.activated
+   ?('✅ 已接入，当前模型：'+st.model)
+   :'反代已启动，正在打开 WorkBuddy 看板；登录账号后会自动接入。','ok');
+  await loadProxy();
+  const url='http://127.0.0.1:'+((PX.config&&PX.config.port)||port)+'/';
+  if(win&&!win.closed)win.location.href=url;
+  else if(!window.open(url,'_blank'))
+   msg('px-msg','反代已启动，但浏览器拦截了弹窗；请点「📊 WorkBuddy 看板」登录。','err');
+ }finally{pxBusy=false;loadProxy()}}
 async function pxStart(){if(pxBusy)return;pxBusy=true;
- msg('px-msg','⏳ 正在启动反代并接入（含内核重启，QQ 瞬断几秒）…','');
- try{const j=await(await fetch('/api/proxy/start',{method:'POST',
-  headers:{'Content-Type':'application/json'},body:'{}'})).json();
+ msg('px-msg','⏳ 正在检查/启动反代并接入（含内核重启，QQ 瞬断几秒）…','');
+ try{
+  if(!(PX.install&&PX.install.installed)){
+   const ins=await pxPost('/api/proxy/install');
+   if(!ins.ok){msg('px-msg','❌ '+(ins.error||'安装失败'),'err');return}
+   await loadProxy();
+  }
+  const j=await pxPost('/api/proxy/start');
   if(j.ok){msg('px-msg','✅ '+((j.activated?'已接入，当前模型：'+j.model:j.note||'已启动')+
    (j.restarted?'（内核已重启）':'')),'ok');
    if(j.models&&j.models.length){PX.models=j.models;renderProxy()}}
@@ -880,16 +982,28 @@ async function pxStop(){if(pxBusy)return;pxBusy=true;
   msg('px-msg',(j.ok?'✅ ':'❌ ')+(j.detail||j.error||''),j.ok?'ok':'err');
   loadProxy()}finally{pxBusy=false}}
 async function saveProxyCfg(){
- await fetch('/api/proxy/config',{method:'POST',headers:{'Content-Type':'application/json'},
+ const m=($('px-model').value||$('px-model-manual').value||'').trim();
+ const j=await(await fetch('/api/proxy/config',{method:'POST',
+  headers:{'Content-Type':'application/json'},
   body:JSON.stringify({path:$('px-path').value,port:$('px-port').value,
-   api_key:$('px-key').value})});
- msg('px-msg','✅ 设置已保存','ok');loadProxy()}
+   api_key:$('px-key').value})})).json();
+ if(!j.ok){msg('px-msg','❌ '+(j.error||'保存失败'),'err');return}
+ // 模型不在“设置”里：如果用户选了/填了新模型，顺手应用，避免“保存后又变回旧模型”
+ if(m&&m!==(PX.config.model||'')){
+  const jm=await(await fetch('/api/proxy/model',{method:'POST',
+   headers:{'Content-Type':'application/json'},body:JSON.stringify({model:m})})).json();
+  if(!jm.ok){msg('px-msg','❌ 设置已保存，但模型未应用：'+(jm.error||''),'err');
+   await loadProxy();return}
+  msg('px-msg','✅ 设置已保存，模型已应用：'+m+(jm.restarted?'（内核已重启）':''),'ok');
+ }else msg('px-msg','✅ 设置已保存','ok');
+ await loadProxy()}
 async function applyProxyModel(){
- const m=$('px-model-manual').value||$('px-model').value;
+ const m=($('px-model-manual').value||$('px-model').value||'').trim();
  if(!m){msg('px-msg','先选或填模型名','err');return}
  const j=await(await fetch('/api/proxy/model',{method:'POST',
   headers:{'Content-Type':'application/json'},body:JSON.stringify({model:m})})).json();
- msg('px-msg',j.ok?'✅ 模型已应用：'+m+(j.restarted?'（内核已重启）':''):'❌ '+(j.error||''),j.ok?'ok':'err');
+ if(j.ok){PX.config.model=m;msg('px-msg','✅ 模型已应用：'+m+(j.restarted?'（内核已重启）':''),'ok');
+  await loadProxy()}else msg('px-msg','❌ '+(j.error||''),'err');
  loadCfg(true)}
 loadProviders().then(()=>loadCfg(true));loadPersonas();loadPlugins();loadJailbreak();
 loadSched();refresh();loadLogs();

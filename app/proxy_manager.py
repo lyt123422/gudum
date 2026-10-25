@@ -1,7 +1,8 @@
 """WorkBuddy 反代管理器：启动/停止本地模型网关 + 健康探活 + 守护。
 
-WorkBuddy2API-Hub（F:\\WorkBuddy-Hub，MIT）把腾讯 workbuddy.ai / codebuddy.cn
-封装成 OpenAI 兼容接口。gudum 把它当"本地模型提供商"托管：
+WorkBuddy2API-Hub（MIT）把腾讯 workbuddy.ai / codebuddy.cn 封装成 OpenAI
+兼容接口。gudum 把它当"本地模型提供商"托管；安装位置由
+workbuddy_setup 决定（默认 data/workbuddy-hub，也支持用户已有目录）。
 
 - 启动：端口已在监听则识别为运行中（含用户手动/看板启动），不重复拉起
 - 健康判定：GET /health（ok=true）
@@ -23,10 +24,12 @@ from pathlib import Path
 import httpx
 from nonebot.log import logger
 
+from . import workbuddy_setup
+
 ROOT = Path(__file__).resolve().parents[1]
 PROXY_FILE = ROOT / "data" / "proxy.json"
 
-DEFAULT_PATH = r"F:\WorkBuddy-Hub"
+DEFAULT_PATH = str(workbuddy_setup.install_dir())
 DEFAULT_PORT = 8788
 
 _state: dict = {"proc": None, "watchdog": None,
@@ -36,11 +39,21 @@ _lock = threading.Lock()
 
 # ---------- 配置（data/proxy.json） ----------
 
+def _resolve_path(preferred: str = "") -> str:
+    """配置里的路径优先；失效时回退到本机已安装/默认安装目录。"""
+    found = workbuddy_setup.detect(preferred)
+    if found:
+        return str(found)
+    if preferred:
+        return str(Path(preferred).expanduser())
+    return DEFAULT_PATH
+
+
 def config() -> dict:
     try:
         data = json.loads(PROXY_FILE.read_text(encoding="utf-8"))
         if isinstance(data, dict):
-            data.setdefault("path", DEFAULT_PATH)
+            data["path"] = _resolve_path(str(data.get("path") or ""))
             data.setdefault("port", DEFAULT_PORT)
             data.setdefault("api_key", "")
             data.setdefault("model", "")
@@ -49,7 +62,7 @@ def config() -> dict:
             return data
     except (OSError, ValueError):
         pass
-    return {"path": DEFAULT_PATH, "port": DEFAULT_PORT, "api_key": "",
+    return {"path": _resolve_path(), "port": DEFAULT_PORT, "api_key": "",
             "model": "", "active": False, "previous": None}
 
 
@@ -153,14 +166,25 @@ def start() -> tuple[bool, str]:
         cfg = config()
         proxy_path = Path(cfg["path"])
         script = proxy_path / "wb_proxy.py"
-        if not script.exists():
-            return False, f"没找到 {script}：请确认反代路径设置"
+        if not script.is_file():
+            # 其他用户第一次用：没有 WorkBuddy-Hub 就自动下载官方发布包。
+            try:
+                info = workbuddy_setup.ensure_installed(cfg.get("path"))
+            except workbuddy_setup.SetupError as exc:
+                return False, f"WorkBuddy-Hub 未安装：{exc}"
+            cfg["path"] = info["path"]
+            save_config(cfg)
+            proxy_path = Path(cfg["path"])
+            script = proxy_path / "wb_proxy.py"
+            if not script.is_file():
+                return False, f"安装后仍没找到 {script}"
         exe = _python_exe(proxy_path)
         logfile = (ROOT / "data" / "proxy.log").open("a", encoding="utf-8")
         logfile.write(f"\n===== {time.strftime('%Y-%m-%d %H:%M:%S')} 启动 =====\n")
         try:
             _state["proc"] = subprocess.Popen(
-                [exe, str(script), "--port", str(cfg["port"])],
+                [exe, str(script), "--host", "127.0.0.1",
+                 "--port", str(cfg["port"])],
                 cwd=proxy_path, stdout=logfile, stderr=subprocess.STDOUT,
                 creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
         except Exception as exc:   # noqa: BLE001
