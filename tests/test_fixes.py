@@ -155,62 +155,14 @@ class TestVision(unittest.TestCase):
             asyncio.run(vision.fetch_data_url("https://evil.com/a.png"))
 
 
-class TestDouyinPageLifecycle(unittest.TestCase):
-    """评审 P1-2：page 存活判定与清理。"""
+class TestDailyLedgerRemoved(unittest.TestCase):
+    """刷抖音功能已整体移除（2026-10-25 用户决策）：防回归——模块不得再出现。"""
 
-    def test_page_alive(self):
-        from app import douyin
-
-        class Good:
-            class states:
-                is_alive = True
-
-        class Dead:
-            class states:
-                is_alive = False
-
-        class Boom:
-            @property
-            def states(self):
-                raise RuntimeError("dead")
-
-        self.assertTrue(douyin._page_alive(Good()))
-        self.assertFalse(douyin._page_alive(Dead()))
-        self.assertFalse(douyin._page_alive(Boom()))
-
-    def test_drop_page_quits_and_clears(self):
-        from app import douyin
-
-        class Fake:
-            def __init__(self):
-                self.calls = []
-
-            def quit(self, **kw):
-                self.calls.append(kw)
-
-        fake = Fake()
-        douyin._state["page"] = fake
-        douyin._drop_page()
-        self.assertIsNone(douyin._state["page"])
-        self.assertEqual(len(fake.calls), 1)
-
-
-class TestDailyLedger(unittest.TestCase):
-    """评审 P2-4：账本遇到损坏/异形 JSON 不炸。"""
-
-    def test_shapes(self):
-        from app import douyin
-        with tempfile.TemporaryDirectory() as tmp:
-            f = Path(tmp) / "daily.json"
-            with mock.patch.object(douyin, "DAILY_FILE", f):
-                f.write_text("[]", encoding="utf-8")
-                self.assertEqual(douyin._daily_minutes(), 0)
-                f.write_text("{broken", encoding="utf-8")
-                self.assertEqual(douyin._daily_minutes(), 0)
-                douyin._add_daily(7)
-                self.assertEqual(douyin._daily_minutes(), 7)
-                douyin._add_daily(3)
-                self.assertEqual(douyin._daily_minutes(), 10)
+    def test_douyin_module_gone(self):
+        from pathlib import Path
+        root = Path(__file__).resolve().parents[1]
+        self.assertFalse((root / "app" / "douyin.py").exists())
+        self.assertFalse((root / "app" / "plugins" / "douyin.py").exists())
 
 
 class TestRedactLog(unittest.TestCase):
