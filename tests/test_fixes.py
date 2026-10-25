@@ -166,15 +166,20 @@ class TestDouyinRealDevice(unittest.TestCase):
         self.assertNotIn("get_screenshot", src)   # 网页截屏痕迹
         self.assertIn("uiautomator2", src)        # 真机方案在位
 
+    def tearDown(self):
+        # 安全阀：任何用例都不得在真机上留下运行中的会话
+        from app import douyin
+        douyin.stop()
+
     def test_start_requires_connection(self):
         from app import douyin
-        # 无手机连接时 start 应友好报错而不是崩；测试中不允许真下载 adb
+        # 测试绝不触碰真机：mock 掉连接，只验证失败路径的报错文案
         douyin._state["device"] = None
-        with mock.patch.object(douyin, "download_adb",
-                               lambda: (False, "测试环境不下载")):
+        with mock.patch.object(douyin, "connect",
+                               lambda: (False, "测试环境：不连手机")):
             ok, msg = douyin.start(1)
         self.assertFalse(ok)
-        self.assertTrue("手机" in msg or "adb" in msg or "下载" in msg)
+        self.assertIn("测试环境", msg)
 
 
 class TestRedactLog(unittest.TestCase):
