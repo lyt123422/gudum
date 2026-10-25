@@ -26,11 +26,19 @@ BUILTIN: list[dict] = [
      "desc": "「语音开」后回复附带配音；人设可指定专属音色（edge-tts 免费）", "default": True},
     {"id": "memes", "name": "表情包",
      "desc": "存表情 / 表情包 / 斗图，本地表情库", "default": True},
+    {"id": "douyin", "name": "抖音真机",
+     "desc": "QQ 遥控安卓手机真刷抖音（真滑动真声音），AI 看屏幕做决策；"
+             "需在市场安装依赖并 USB 连接手机", "default": False},
 ]
 
 # 精选市场（pip 包名务必真实存在；描述里写清"装完怎么用"，不装糊涂账）
 # type=local 表示"本地内置插件，安装=装依赖+开启"，不是 pip 第三方
 MARKET: list[dict] = [
+    {"pip": "local:douyin", "type": "local", "id": "douyin",
+     "deps": ["uiautomator2"],
+     "name": "抖音真机", "cat": "刷抖音",
+     "desc": "QQ 遥控安卓手机真刷抖音：真滑动/真声音/真点赞，AI 看真实屏幕做决策。"
+             "需手机开 USB 调试连电脑；限单次60分钟/每日120分钟，管理员专用"},
     {"pip": "nonebot-plugin-htmlrender", "module": "nonebot_plugin_htmlrender",
      "name": "HTML 渲染图片", "cat": "底座",
      "desc": "把网页/HTML 渲染成图片的底座组件。单独装没有对话功能，"

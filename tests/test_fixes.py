@@ -155,14 +155,26 @@ class TestVision(unittest.TestCase):
             asyncio.run(vision.fetch_data_url("https://evil.com/a.png"))
 
 
-class TestDailyLedgerRemoved(unittest.TestCase):
-    """刷抖音功能已整体移除（2026-10-25 用户决策）：防回归——模块不得再出现。"""
+class TestDouyinRealDevice(unittest.TestCase):
+    """抖音真机模块（网页版已移除，防回归：不得再出现网页抓取方案）。"""
 
-    def test_douyin_module_gone(self):
+    def test_web_scraping_gone(self):
         from pathlib import Path
-        root = Path(__file__).resolve().parents[1]
-        self.assertFalse((root / "app" / "douyin.py").exists())
-        self.assertFalse((root / "app" / "plugins" / "douyin.py").exists())
+        src = (Path(__file__).resolve().parents[1] / "app" / "douyin.py").read_text(
+            encoding="utf-8")
+        self.assertNotIn("DrissionPage", src)
+        self.assertNotIn("get_screenshot", src)   # 网页截屏痕迹
+        self.assertIn("uiautomator2", src)        # 真机方案在位
+
+    def test_start_requires_connection(self):
+        from app import douyin
+        # 无手机连接时 start 应友好报错而不是崩；测试中不允许真下载 adb
+        douyin._state["device"] = None
+        with mock.patch.object(douyin, "download_adb",
+                               lambda: (False, "测试环境不下载")):
+            ok, msg = douyin.start(1)
+        self.assertFalse(ok)
+        self.assertTrue("手机" in msg or "adb" in msg or "下载" in msg)
 
 
 class TestRedactLog(unittest.TestCase):
