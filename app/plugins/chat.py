@@ -612,6 +612,38 @@ cmd_model_switch = on_command("切换模型", aliases={"换模型"},
 cmd_reshuffle = on_command("重摇", aliases={"重新生成"},
                            rule=_cmd_gate, priority=4, block=True)
 
+
+def _default_profile() -> str:
+    return (load_env(ENV_FILE).get("DEFAULT_MODEL_PROFILE") or "自定义").strip()
+
+
+async def _model_alias(event: MessageEvent) -> bool:
+    """裸关键词自动切模型（管理员）：整句等于档案名/唯一前缀/「默认」才触发。
+    群里仍要求 @ 或 / 前缀，防止群友随便打个词就切模型。"""
+    if not _is_admin(event.user_id):
+        return False
+    if event.message_type == "group" and not event.is_tome() \
+            and not event.get_plaintext().strip().startswith("/"):
+        return False
+    return model_profiles.resolve_alias(
+        model_profiles.load_profiles(), event.get_plaintext(), _default_profile()) \
+        is not None
+
+
+msg_model_alias = on_message(rule=Rule(_model_alias), priority=3, block=True)
+
+
+@msg_model_alias.handle()
+async def _(matcher, event: MessageEvent):
+    text = event.get_plaintext().strip()
+    target = model_profiles.resolve_alias(
+        model_profiles.load_profiles(), text, _default_profile())
+    if target is None:
+        return
+    ok, msg_text = await _switch_model(target)
+    prefix = "默认 → " if text == "默认" else ""
+    await matcher.finish(("✅ " if ok else "❌ ") + prefix + msg_text)
+
 msg_group = on_message(rule=Rule(_group_at_me), priority=10, block=True)
 msg_private = on_message(rule=Rule(_is_private), priority=50, block=True)
 

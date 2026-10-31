@@ -1915,5 +1915,52 @@ class TestReshuffleHelpers(unittest.TestCase):
         self.assertEqual(len(m.sent), 2)
 
 
+class TestModelAlias(unittest.TestCase):
+    """裸关键词自动切模型：整句匹配、默认档案、前缀歧义。"""
+
+    def test_resolve_alias(self):
+        from app import model_profiles as mp
+        profiles = {"gemini": {}, "讯飞spark": {}, "自定义": {}, "硅基流动": {}}
+        self.assertEqual(mp.resolve_alias(profiles, " GemIni ", ""), "gemini")   # 大小写不敏感
+        self.assertEqual(mp.resolve_alias(profiles, "默认", "自定义"), "自定义")
+        self.assertIsNone(mp.resolve_alias(profiles, "默认", "不存在"))
+        self.assertEqual(mp.resolve_alias(profiles, "讯飞", ""), "讯飞spark")   # 唯一前缀
+        self.assertIsNone(mp.resolve_alias(profiles, "geminix", ""))            # 非前缀
+        self.assertIsNone(mp.resolve_alias(profiles, "帮我用gemini", ""))       # 整句才触发
+        self.assertIsNone(mp.resolve_alias({"a1": {}, "a2": {}}, "a", ""))      # 前缀歧义
+        self.assertIsNone(mp.resolve_alias(profiles, "", ""))
+
+    def test_panel_accepts_saved_profile_name(self):
+        """面板保存自定义名字的已存档案（如 讯飞spark）不再报未知提供商。"""
+        with tempfile.TemporaryDirectory() as td:
+            from fastapi.testclient import TestClient
+            from app import panel
+            env = Path(td) / ".env"
+            env.write_text('SUPERUSERS=["10000"]\n', encoding="utf-8")
+            profiles = Path(td) / "providers.json"
+            profiles.write_text(json.dumps({
+                "讯飞spark": {"base_url": "https://spark.example/v1",
+                              "api_key": "ak-test-123456789",
+                              "model": "spark-x2.6"}}, ensure_ascii=False),
+                encoding="utf-8")
+            patches = [
+                mock.patch.object(panel, "ENV_FILE", env),
+                mock.patch.object(panel, "PROVIDERS_FILE", profiles),
+                mock.patch.object(panel, "_running", lambda n: False),
+                mock.patch.object(panel, "_pid_on_port", lambda p: None),
+                mock.patch.object(panel, "_restart_kernel_if_running",
+                                  mock.AsyncMock(return_value=False)),
+            ]
+            for p in patches:
+                p.start()
+            self.addCleanup(lambda: [p.stop() for p in patches])
+            client = TestClient(panel.app, base_url="http://127.0.0.1:8090")
+            r = client.post("/api/save", json={
+                "provider": "讯飞spark", "base_url": "https://spark.example/v1",
+                "model": "spark-x2.6"}).json()
+            self.assertTrue(r["ok"], r)
+            self.assertIn("spark.example", env.read_text(encoding="utf-8"))
+
+
 if __name__ == "__main__":
     unittest.main()

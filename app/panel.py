@@ -327,7 +327,8 @@ async def api_save(request: Request) -> dict:
     proxy_note = ""
     provider = str(body.get("provider") or "").strip()
     if provider and provider not in PROVIDER_PRESETS \
-            and provider != PROXY_PROVIDER:
+            and provider != PROXY_PROVIDER \
+            and provider not in _load_profiles():   # 自定义名字的已存档案也允许
         return {"ok": False, "error": f"未知的提供商: {provider}"}
     # 只更新请求里显式携带的非空字段：掩码/空值=不修改，残缺请求不清配置
     field_map = {"base_url": "DEEPSEEK_BASE_URL", "api_key": "DEEPSEEK_API_KEY",

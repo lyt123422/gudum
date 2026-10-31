@@ -616,7 +616,15 @@ function renderProvs(){const box=$('provs');box.innerHTML='';
   d.className='prov'+(k===curProv?' on':'');
   d.textContent=k+(k===liveProv?' ●':'');
   d.title=k===liveProv?'当前生效':'点击载入该提供商的档案';
-  d.onclick=()=>fillProvider(k);box.appendChild(d)})}
+  d.onclick=()=>fillProvider(k);box.appendChild(d)});
+ // 已保存的非内置档案（讯飞spark/gemini/qwen 这类自定义名字）：也必须能看见、能点选
+ Object.keys(PROFILES).forEach(k=>{if(PROFILES[k]&&!(k in PRESETS)){
+  const d=document.createElement('div');
+  d.className='prov'+(k===curProv?' on':'');
+  d.textContent='📁 '+k+(k===liveProv?' ●':'');
+  d.title='已保存的档案'+(k===liveProv?'（当前生效）':'：点击载入');
+  d.style.borderStyle='dashed';
+  d.onclick=()=>fillProvider(k);box.appendChild(d)}})}
 async function saveCfg(part){
  // 审计 F4：QQ 卡片与模型卡片分开保存，不再互相夹带字段
  // （原来一个保存函数把 provider/base_url/model 一起送上，改 QQ 号也会动模型档案）

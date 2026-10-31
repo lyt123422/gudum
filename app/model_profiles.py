@@ -41,6 +41,27 @@ def match_name(profiles: dict[str, dict], query: str) -> str | None:
     return hits[0] if len(hits) == 1 else None
 
 
+def resolve_alias(profiles: dict[str, dict], text: str,
+                  default_profile: str = "") -> str | None:
+    """QQ 裸关键词自动切模型：「默认」→ 默认档案；档案名精确/唯一前缀（大小写不敏感）。
+
+    整句匹配（strip 后完全相等），普通聊天句子不会误触发。
+    """
+    t = (text or "").strip()
+    if not t:
+        return None
+    if t == "默认":
+        return default_profile if default_profile in profiles else None
+    lowered = t.lower()
+    exact = [n for n in profiles if n.lower() == lowered]
+    if len(exact) == 1:
+        return exact[0]
+    if len(exact) > 1:
+        return None
+    prefix = [n for n in profiles if n.lower().startswith(lowered)]
+    return prefix[0] if len(prefix) == 1 else None
+
+
 def is_local_base(base_url: str) -> bool:
     return (base_url or "").strip().startswith(("http://127.0.0.1", "http://localhost"))
 
