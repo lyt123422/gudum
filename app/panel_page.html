@@ -589,7 +589,12 @@ function formFocused(){return ['f-base','f-key','f-model','f-account','f-su']
  .some(id=>document.activeElement===$(id))}
 async function pollPersonaName(){   // 周期任务只刷总览人设名，绝不碰表单和提供商高亮
  try{const c=await(await fetch('/api/config')).json();
-  $('s-persona').textContent=c.persona_name||'-'}catch(e){}}
+  $('s-persona').textContent=c.persona_name||'-'}catch(e){}
+ // QQ 侧（手机）切换人设时，人设管理页的"当前"徽标自动跟上；
+ // 正在编辑（有未保存修改或输入框聚焦）时绝不重填，防止覆盖用户输入
+ if(document.querySelector('#pg-persona.on')&&!personaDirty
+    &&document.activeElement!==$('p-raw')){
+  try{await loadPersonas()}catch(e){}}}
 async function loadProviders(){
  const d=await(await fetch('/api/providers')).json();
  PRESETS=d.presets||{};PROFILES=d.saved||{}}
@@ -658,6 +663,8 @@ function msg(id,text,cls){const e=$(id);e.textContent=text;e.className='msg '+(c
 
 /* ---------- 人设管理 ---------- */
 let P={active:'',personas:{}},selP='';
+let personaDirty=false;   // 编辑器有未保存修改时，周期轮询绝不重填覆盖
+$('p-raw').addEventListener('input',()=>personaDirty=true);
 async function loadPersonas(){P=await(await fetch('/api/personas')).json();
  if(!P.personas[P.active])P.active=Object.keys(P.personas)[0]||'';
  if(!selP||!P.personas[selP])selP=P.active;
@@ -691,7 +698,8 @@ function renderPersonas(){const box=$('p-list');box.innerHTML='';
  $('p-editing').textContent=selP?('—— '+selP+(selP===P.active?'（当前生效）':'')):'';
  $('p-raw').value=P.personas[selP]||'';
  $('p-del').disabled=!selP||Object.keys(P.personas).length<=1;
- $('p-use').disabled=!selP||selP===P.active}
+ $('p-use').disabled=!selP||selP===P.active;
+ personaDirty=false}   // 刚从服务端重填，与服务器一致
 async function usePersona(){if(!selP)return;
  const j=await(await fetch('/api/persona/switch',{method:'POST',
   headers:{'Content-Type':'application/json'},body:JSON.stringify({name:selP})})).json();
