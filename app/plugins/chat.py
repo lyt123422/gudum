@@ -673,6 +673,28 @@ def _split_chunk(text: str, limit: int = 800) -> list[str]:
     return parts
 
 
+def _slim_messages(messages: list[dict]) -> list[dict]:
+    """重摇存档瘦身：内联图片（base64 data URL）换成占位文本。
+
+    _LAST_REPLY 常驻内存最多 200 个会话；带图请求的 base64 可达数 MB/张，
+    服务器内核内存上限 400M，不瘦身会累积爆内存（审查 2026-10-31）。
+    代价：重摇带图的那条回复时丢失图片上下文（重摇是低频操作，可接受）。
+    """
+    slim: list[dict] = []
+    for m in messages:
+        content = m.get("content")
+        if isinstance(content, list):
+            parts = []
+            for p in content:
+                if isinstance(p, dict) and p.get("type") == "image_url":
+                    parts.append({"type": "text", "text": "[图片]"})
+                else:
+                    parts.append(p)
+            m = {**m, "content": parts}
+        slim.append(m)
+    return slim
+
+
 async def _send_chunks(matcher, answer: str) -> list[int]:
     """分段发送，块间随机小停顿（评审 P2-17）；返回每块的 message_id（重摇撤回用）。"""
     chunks = _split_chunk(answer)
@@ -815,8 +837,9 @@ async def _do_chat(matcher, event: MessageEvent, q: str,
         memory_remember(key, q + (f" [图片×{len(images)}]" if images else ""), reply)
         try:
             sent_ids = await _send_chunks(matcher, web_note + _terse(reply, q))
-            # 记录本次回复（撤回/重摇用）：id 给撤回，完整上下文给重摇重生成
-            _LAST_REPLY[key] = {"msg_ids": sent_ids, "messages": messages,
+            # 记录本次回复（撤回/重摇用）：id 给撤回，上下文瘦身后给重摇重生成
+            _LAST_REPLY[key] = {"msg_ids": sent_ids,
+                                "messages": _slim_messages(messages),
                                 "last_reply": reply}
             _trim(_LAST_REPLY, 200)
         except ActionFailed as exc:

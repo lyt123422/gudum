@@ -1833,7 +1833,9 @@ class TestSamplingParams(unittest.TestCase):
             env.write_text("DEEPSEEK_MODEL=m\nDEEPSEEK_BASE_URL=https://x.example\n"
                            "FREQUENCY_PENALTY=9\nPRESENCE_PENALTY=abc\n",
                            encoding="utf-8")
-            with mock.patch.object(chat_mod, "ENV_FILE", env):
+            with mock.patch.object(chat_mod, "ENV_FILE", env), \
+                    mock.patch.object(chat_mod, "_cfg",
+                                      lambda n, d: d):   # 隔离真实 .env 的兜底值
                 cfg = chat_mod._live_model_config()
             self.assertEqual(cfg["frequency_penalty"], 2.0)   # 超上限钳到 2
             self.assertEqual(cfg["presence_penalty"], 0.0)     # 坏值回退 0
