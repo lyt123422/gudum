@@ -1962,5 +1962,32 @@ class TestModelAlias(unittest.TestCase):
             self.assertIn("spark.example", env.read_text(encoding="utf-8"))
 
 
+class TestPlainify(unittest.TestCase):
+    """Markdown→QQ 纯文本：格式符全清、内容保留、零宽字符清除。"""
+
+    def test_markdown_stripped(self):
+        _ensure_nonebot_init()
+        from app.plugins import chat as chat_mod
+        raw = ("### 标题\n**加粗**内容\n---\n* 项目一\n* 项目二\n"
+               "`代码` 和 **再见**")
+        out = chat_mod._plainify(raw)
+        self.assertNotIn("**", out)
+        self.assertNotIn("###", out)
+        self.assertNotIn("---", out)
+        self.assertNotIn("`", out)
+        self.assertIn("标题", out)
+        self.assertIn("加粗内容", out)
+        self.assertIn("· 项目一", out)
+        self.assertIn("· 项目二", out)
+
+    def test_plain_untouched_and_zero_width(self):
+        _ensure_nonebot_init()
+        from app.plugins import chat as chat_mod
+        plain = "今天天气不错，我们出去走走吧。"
+        self.assertEqual(chat_mod._plainify(plain), plain)
+        self.assertEqual(chat_mod._plainify("你\u200b好"), "你好")
+        self.assertEqual(chat_mod._plainify("2*3*4=24"), "2*3*4=24")   # 数学星号不误伤
+
+
 if __name__ == "__main__":
     unittest.main()

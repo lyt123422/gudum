@@ -668,6 +668,36 @@ HELP_TEXT = (
 # 用户明确要长回答时不做限长截断
 _DETAIL_RE = re.compile(r"详细|展开|具体|说清楚|仔细|长一点|完整|列出|清单|步骤|教程|攻略|原理")
 
+# ---------- Markdown → QQ 纯文本（实测 gemini/ministral 每条回复带 8~15 处格式符） ----------
+_MD_FENCE_RE = re.compile(r"^\s*[\x60]{3,}.*$", re.M)            # ``` 围栏行
+_MD_HR_RE = re.compile(r"^\s*(-{3,}|\*{3,}|_{3,})\s*$", re.M)   # --- 分隔线
+_MD_HEAD_RE = re.compile(r"^\s*#{1,6}\s*", re.M)                 # ### 标题井号
+_MD_BOLD_RE = re.compile(r"\*\*(.+?)\*\*", re.S)
+_MD_BOLD2_RE = re.compile(r"__(.+?)__", re.S)
+_MD_ITALIC_RE = re.compile(r"(?<![\w*])\*([^*\s][^*\n]*?)\*(?![\w*])")
+_MD_BULLET_RE = re.compile(r"^\s*[-*]\s+", re.M)
+_MD_BACKTICK_RE = re.compile(r"[\x60]+")
+_ZW_RE = re.compile(r"[\u200b-\u200f\ufeff]")
+
+
+def _plainify(text: str) -> str:
+    """把模型输出的 Markdown 转成 QQ 纯文本。
+
+    外国模型（gemini/ministral 等）默认输出 **加粗**、### 标题、--- 分隔线，
+    QQ 不渲染，用户看到的是原始符号（2026-10-31 实测每条 8~15 处）。
+    只去格式、不动内容；中文引号等正常标点保留。
+    """
+    text = _ZW_RE.sub("", text)
+    text = _MD_FENCE_RE.sub("", text)
+    text = _MD_HR_RE.sub("", text)
+    text = _MD_HEAD_RE.sub("", text)
+    text = _MD_BOLD_RE.sub(r"\1", text)
+    text = _MD_BOLD2_RE.sub(r"\1", text)
+    text = _MD_ITALIC_RE.sub(r"\1", text)
+    text = _MD_BULLET_RE.sub("· ", text)
+    text = _MD_BACKTICK_RE.sub("", text)
+    return re.sub(r"\n{3,}", "\n\n", text).strip()
+
 
 def _terse(text: str, asked: str) -> str:
     """限长护栏：超长按句子边界截断并留「详细」出口；CHAT_MAX_CHARS=0 关闭。"""
@@ -865,14 +895,17 @@ async def _do_chat(matcher, event: MessageEvent, q: str,
             return   # matcher.finish 正常会抛 FinishedException；这里兜底防 reply 未赋值
         if _SESSION_GEN.get(key, 0) != gen:
             return   # 等待期间会话被「重置」了，丢弃过期回复
+        reply_plain = _plainify(reply)   # Markdown 转纯文本：记忆/发送/语音都用干净版
         # 记忆只存文字 + 轻量图片标记，不存 base64/签名 URL（评审 P1-5.7）
-        memory_remember(key, q + (f" [图片×{len(images)}]" if images else ""), reply)
+        memory_remember(key, q + (f" [图片×{len(images)}]" if images else ""),
+                        reply_plain)
         try:
-            sent_ids = await _send_chunks(matcher, web_note + _terse(reply, q))
+            sent_ids = await _send_chunks(
+                matcher, web_note + _terse(reply_plain, q))
             # 记录本次回复（撤回/重摇用）：id 给撤回，上下文瘦身后给重摇重生成
             _LAST_REPLY[key] = {"msg_ids": sent_ids,
                                 "messages": _slim_messages(messages),
-                                "last_reply": reply}
+                                "last_reply": reply_plain}
             _trim(_LAST_REPLY, 200)
         except ActionFailed as exc:
             # QQ 风控禁言(如 Ban state forbit write req)：发不出去不是崩溃，
@@ -886,7 +919,8 @@ async def _do_chat(matcher, event: MessageEvent, q: str,
         voice_name = active.voice or TTS_VOICE
     if want_voice:
         try:
-            mp3 = await asyncio.wait_for(tts.synth(reply, voice_name), timeout=30)
+            mp3 = await asyncio.wait_for(
+                tts.synth(reply_plain, voice_name), timeout=30)
             await matcher.send(MessageSegment.record(
                 f"file:///{mp3.resolve().as_posix()}"))
         except ActionFailed as exc:
@@ -1281,7 +1315,7 @@ async def _(bot: Bot, matcher, event: MessageEvent):
         await matcher.finish("我还在回上一条消息，稍等一下再重摇～")
     async with lock:
         try:   # 先生成：失败时原回复原封不动，零成本退出
-            new_reply = await _ensure_client().chat(info["messages"])
+            new_reply = _plainify(await _ensure_client().chat(info["messages"]))
         except DeepSeekError as exc:
             await matcher.finish(f"😵 重摇失败：{exc.message}（原回复保留）")
             return
