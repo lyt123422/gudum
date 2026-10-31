@@ -1815,5 +1815,103 @@ class TestModelSwitch(unittest.TestCase):
             self.assertIn("反代", msg)
 
 
+class TestSamplingParams(unittest.TestCase):
+    """采样惩罚：.env 解析钳位、客户端只在非零时下发。"""
+
+    def test_live_config_reads_penalties(self):
+        _ensure_nonebot_init()
+        from app.plugins import chat as chat_mod
+        with tempfile.TemporaryDirectory() as td:
+            env = Path(td) / ".env"
+            env.write_text("DEEPSEEK_MODEL=m\nDEEPSEEK_BASE_URL=https://x.example\n"
+                           "FREQUENCY_PENALTY=0.5\nPRESENCE_PENALTY=0.3\n",
+                           encoding="utf-8")
+            with mock.patch.object(chat_mod, "ENV_FILE", env):
+                cfg = chat_mod._live_model_config()
+            self.assertEqual(cfg["frequency_penalty"], 0.5)
+            self.assertEqual(cfg["presence_penalty"], 0.3)
+            env.write_text("DEEPSEEK_MODEL=m\nDEEPSEEK_BASE_URL=https://x.example\n"
+                           "FREQUENCY_PENALTY=9\nPRESENCE_PENALTY=abc\n",
+                           encoding="utf-8")
+            with mock.patch.object(chat_mod, "ENV_FILE", env):
+                cfg = chat_mod._live_model_config()
+            self.assertEqual(cfg["frequency_penalty"], 2.0)   # 超上限钳到 2
+            self.assertEqual(cfg["presence_penalty"], 0.0)     # 坏值回退 0
+
+    def test_client_sends_penalties_only_when_set(self):
+        from app.deepseek_api import DeepSeekClient
+        captured = {}
+
+        class FakeCompletions:
+            async def create(self, **kw):
+                captured.update(kw)
+                return type("R", (), {"choices": []})()
+
+        class FakeChat:
+            completions = FakeCompletions()
+
+        def make_client(fp, pp):
+            c = DeepSeekClient("https://x.example", "k", "m",
+                               frequency_penalty=fp, presence_penalty=pp)
+            c._client = type("C", (), {"chat": FakeChat()})()
+            return c
+
+        asyncio.run(make_client(0.5, 0.3)._create(
+            [{"role": "user", "content": "x"}], None, 100))
+        self.assertEqual(captured["frequency_penalty"], 0.5)
+        self.assertEqual(captured["presence_penalty"], 0.3)
+        captured.clear()
+        asyncio.run(make_client(0.0, 0.0)._create(
+            [{"role": "user", "content": "x"}], None, 100))
+        self.assertNotIn("frequency_penalty", captured)   # 0 值不下发
+        self.assertNotIn("presence_penalty", captured)
+
+
+class TestReshuffleHelpers(unittest.TestCase):
+    """重摇的记忆弹栈/回填与发送 id 采集。"""
+
+    def test_memory_pop_and_append(self):
+        _ensure_nonebot_init()
+        from app.plugins import chat as chat_mod
+        with tempfile.TemporaryDirectory() as td:
+            mem = Path(td) / "memory"
+            mem.mkdir()
+            with mock.patch.object(chat_mod, "_MEMORY_DIR", mem):
+                key = "p123"
+                path = chat_mod._mem_path(key)
+                path.write_text(json.dumps({"ts": time.time(), "msgs": [
+                    {"role": "user", "content": "Q1"},
+                    {"role": "assistant", "content": "A1"},
+                    {"role": "user", "content": "Q2"},
+                    {"role": "assistant", "content": "A2"}]}, ensure_ascii=False),
+                    encoding="utf-8")
+                self.assertTrue(chat_mod._memory_pop_last_reply(key))
+                data = json.loads(path.read_text(encoding="utf-8"))
+                self.assertEqual(data["msgs"][-1]["content"], "Q2")
+                chat_mod._memory_append_assistant(key, "A2-new")
+                data = json.loads(path.read_text(encoding="utf-8"))
+                self.assertEqual(data["msgs"][-1]["content"], "A2-new")
+                self.assertEqual(len(data["msgs"]), 4)
+            self.assertFalse(chat_mod._memory_pop_last_reply("不存在"))
+
+    def test_send_chunks_collects_ids(self):
+        _ensure_nonebot_init()
+        from app.plugins import chat as chat_mod
+
+        class FakeMatcher:
+            def __init__(self):
+                self.sent = []
+
+            async def send(self, chunk):
+                self.sent.append(chunk)
+                return {"message_id": 100 + len(self.sent)}
+
+        m = FakeMatcher()
+        text = "甲" * 500 + "\n\n" + "乙" * 500   # 两段各 ~500 字：超单块合并容忍度才分块
+        ids = asyncio.run(chat_mod._send_chunks(m, text))
+        self.assertEqual(len(ids), 2)
+        self.assertEqual(len(m.sent), 2)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -29,10 +29,14 @@ def _reasoning_tokens(resp) -> int:
 class DeepSeekClient:
     def __init__(self, base_url: str, api_key: str, model: str,
                  timeout: float = 60.0, max_retries: int = 2,
-                 temperature: float = 0.8, max_tokens: int = 4096):
+                 temperature: float = 0.8, max_tokens: int = 4096,
+                 frequency_penalty: float = 0.0,
+                 presence_penalty: float = 0.0):
         self.model = model
         self.temperature = temperature
         self.max_tokens = max_tokens
+        self.frequency_penalty = frequency_penalty
+        self.presence_penalty = presence_penalty
         self.base_url = base_url or "https://api.deepseek.com"
         # 空 Key 时填占位值：让请求走出去拿 401，错误信息比构造时报错更友好
         self._client = openai.AsyncOpenAI(
@@ -46,6 +50,15 @@ class DeepSeekClient:
         """释放连接池（评审 v3 P1-5：每次决策新建的客户端必须关，否则泄漏）。"""
         await self._client.close()
 
+    def _sampling_extra(self) -> dict:
+        """采样惩罚参数：0 值不下发（部分服务商对非默认值校验严格）。"""
+        extra: dict = {}
+        if self.frequency_penalty:
+            extra["frequency_penalty"] = self.frequency_penalty
+        if self.presence_penalty:
+            extra["presence_penalty"] = self.presence_penalty
+        return extra
+
     async def _create(self, messages: list[dict], temperature: float | None,
                       max_tokens: int):
         return await self._client.chat.completions.create(
@@ -54,6 +67,7 @@ class DeepSeekClient:
             max_tokens=max_tokens,
             temperature=self.temperature if temperature is None else temperature,
             stream=False,
+            **self._sampling_extra(),
         )
 
     async def chat(self, messages: list[dict],
@@ -139,6 +153,7 @@ class DeepSeekClient:
                     temperature=(self.temperature
                                  if temperature is None else temperature),
                     stream=False,
+                    **self._sampling_extra(),
                 )
                 msg = resp.choices[0].message if resp.choices else None
                 if msg is None or not msg.tool_calls:
@@ -169,6 +184,7 @@ class DeepSeekClient:
                 temperature=(self.temperature
                              if temperature is None else temperature),
                 stream=False,
+                **self._sampling_extra(),
             )
             text = (resp.choices[0].message.content or "").strip() \
                 if resp.choices else ""

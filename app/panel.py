@@ -298,6 +298,8 @@ async def api_config() -> dict:
             "api_key": _mask(env.get("DEEPSEEK_API_KEY", "")),
             "api_key_set": bool(env.get("DEEPSEEK_API_KEY")),
             "model": env.get("DEEPSEEK_MODEL", ""),
+            "frequency_penalty": env.get("FREQUENCY_PENALTY", ""),
+            "presence_penalty": env.get("PRESENCE_PENALTY", ""),
             "live_provider": _live_provider_name(env.get("DEEPSEEK_BASE_URL", "")),
             "persona_name": active.name,
             "napcat_account": env.get("NAPCAT_ACCOUNT", ""),
@@ -330,9 +332,18 @@ async def api_save(request: Request) -> dict:
     # 只更新请求里显式携带的非空字段：掩码/空值=不修改，残缺请求不清配置
     field_map = {"base_url": "DEEPSEEK_BASE_URL", "api_key": "DEEPSEEK_API_KEY",
                  "model": "DEEPSEEK_MODEL", "napcat_account": "NAPCAT_ACCOUNT",
-                 "napcat_password": "NAPCAT_QUICK_PASSWORD"}
+                 "napcat_password": "NAPCAT_QUICK_PASSWORD",
+                 "frequency_penalty": "FREQUENCY_PENALTY",
+                 "presence_penalty": "PRESENCE_PENALTY"}
     values = {env_key: str(body.get(k)).strip() for k, env_key in field_map.items()
               if body.get(k)}
+    for k in ("FREQUENCY_PENALTY", "PRESENCE_PENALTY"):
+        if k in values:
+            try:
+                if not 0 <= float(values[k]) <= 2:
+                    raise ValueError
+            except ValueError:
+                return {"ok": False, "error": f"{k} 必须是 0~2 之间的数字"}
     if values.get("DEEPSEEK_API_KEY") and _looks_masked(values["DEEPSEEK_API_KEY"]):
         return {"ok": False, "error": "检测到掩码 Key：请输入新 Key，或留空保持不变"}
     superuser = str(body.get("superuser") or "").strip()

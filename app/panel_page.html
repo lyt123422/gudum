@@ -162,6 +162,10 @@ pre{background:#0f172a;color:#bbf7d0;font-size:12px;padding:14px;border-radius:1
    <label>Base URL</label><input id="f-base" placeholder="https://api.deepseek.com">
    <label>API Key</label><input id="f-key" placeholder="sk-…（Ollama 本地随便填非空）" type="password">
    <label>模型</label><input id="f-model" placeholder="deepseek-chat">
+   <div style="display:flex;gap:10px">
+    <div style="flex:1"><label>频率惩罚 0~2（治重复，建议 0.3~0.7）</label><input id="f-fp" type="number" step="0.1" min="0" max="2" placeholder="0"></div>
+    <div style="flex:1"><label>存在惩罚 0~2（鼓励新话题）</label><input id="f-pp" type="number" step="0.1" min="0" max="2" placeholder="0"></div>
+   </div>
    <div class="row">
     <button class="green" onclick="saveCfg('model')">💾 保存并重启机器人</button>
     <button class="ghost" onclick="testApi()">🔌 测试连通</button>
@@ -569,7 +573,7 @@ async function oneClick(){await fetch('/api/bot/start',{method:'POST',
 
 /* ---------- 模型配置 ---------- */
 let cfgDirty=false;   // 选过提供商或改过表单 = 编辑中，任何自动刷新都不得回填
-['f-base','f-key','f-model','f-account','f-su'].forEach(id=>
+['f-base','f-key','f-model','f-fp','f-pp','f-account','f-su'].forEach(id=>
  $(id).addEventListener('input',()=>{cfgDirty=true}));
 let maskedKey='';   // 服务端只回掩码：输入框=掩码或空 → 保存时不修改已存 Key
 async function loadCfg(force){
@@ -577,6 +581,7 @@ async function loadCfg(force){
  const c=await(await fetch('/api/config')).json();
  $('f-base').value=c.base_url;maskedKey=c.api_key||'';$('f-key').value=maskedKey;
  $('f-model').value=c.model;
+ $('f-fp').value=c.frequency_penalty||'';$('f-pp').value=c.presence_penalty||'';
  $('f-account').value=c.napcat_account;
  $('f-su').value=(c.superusers||[]).join('，');
  $('pass-state').textContent=c.napcat_password_set?'（已设置，免扫码）':'';
@@ -585,7 +590,7 @@ async function loadCfg(force){
  if(!cfgDirty)curProv=liveProv;
  $('live-prov').textContent='● 当前生效：'+liveProv+'（'+c.model+'）';
  renderProvs()}
-function formFocused(){return ['f-base','f-key','f-model','f-account','f-su']
+function formFocused(){return ['f-base','f-key','f-model','f-fp','f-pp','f-account','f-su']
  .some(id=>document.activeElement===$(id))}
 async function pollPersonaName(){   // 周期任务只刷总览人设名，绝不碰表单和提供商高亮
  try{const c=await(await fetch('/api/config')).json();
@@ -619,6 +624,8 @@ async function saveCfg(part){
  if(part==='model'){
   msg('cfg-msg','保存中…','');
   body.provider=curProv;body.base_url=$('f-base').value;body.model=$('f-model').value;
+  if($('f-fp').value!=='')body.frequency_penalty=$('f-fp').value;
+  if($('f-pp').value!=='')body.presence_penalty=$('f-pp').value;
   const k=$('f-key').value;
   if(k&&k!==maskedKey)body.api_key=k;          // 掩码/空=不修改已存 Key
  }else{

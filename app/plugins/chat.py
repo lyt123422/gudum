@@ -53,6 +53,14 @@ def _cfg(name: str, default: str) -> str:
     return str(v) if v not in (None, "") else default
 
 
+def _fnum(raw: str | None, fallback: str) -> float:
+    """容错浮点：.env 手写坏值不炸管线，回退默认并钳到 0~2。"""
+    try:
+        return max(0.0, min(2.0, float((raw or "").strip() or fallback)))
+    except (TypeError, ValueError):
+        return max(0.0, min(2.0, float(fallback) if fallback else 0.0))
+
+
 def _live_model_config() -> dict:
     """运行期模型配置的唯一事实源：面板保存直接写 .env，内核按需重读。
 
@@ -72,6 +80,11 @@ def _live_model_config() -> dict:
         # 2048 会在长思考时把正文挤成空字符串（实测 gemini-test-flash 约 1/3 概率）
         "max_tokens": int((env.get("CHAT_MAX_TOKENS") or "").strip()
                           or _cfg("CHAT_MAX_TOKENS", "4096")),
+        # 采样惩罚：治"回复重复"的主力，0~2；0=不下发（部分服务商校验严格）
+        "frequency_penalty": _fnum(env.get("FREQUENCY_PENALTY"),
+                                   _cfg("FREQUENCY_PENALTY", "0")),
+        "presence_penalty": _fnum(env.get("PRESENCE_PENALTY"),
+                                  _cfg("PRESENCE_PENALTY", "0")),
     }
 
 
@@ -323,6 +336,42 @@ def memory_clear_all() -> int:
     return count
 
 
+def _memory_pop_last_reply(key: str) -> bool:
+    """重摇：移除记忆中最后一条 assistant 回复——重新生成时看不到旧答案，
+    才会真的"换一个说法"。返回是否成功弹出。"""
+    path = _mem_path(key)
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        msgs = data.get("msgs")
+        if isinstance(msgs, list) and msgs and msgs[-1].get("role") == "assistant":
+            msgs.pop()
+            data["ts"] = time.time()
+            tmp = path.with_suffix(".tmp")
+            tmp.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+            tmp.replace(path)
+            return True
+    except (OSError, ValueError):
+        pass
+    return False
+
+
+def _memory_append_assistant(key: str, reply: str) -> None:
+    """重摇成功后：问题已在记忆里，只把新答句接回去（保持 12 轮上限）。"""
+    path = _mem_path(key)
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        msgs = data.get("msgs")
+        if isinstance(msgs, list) and msgs and msgs[-1].get("role") == "user":
+            msgs.append({"role": "assistant", "content": reply})
+            data["ts"] = time.time()
+            data["msgs"] = msgs[-MEMORY_MAX_ROUNDS * 2:]
+            tmp = path.with_suffix(".tmp")
+            tmp.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+            tmp.replace(path)
+    except (OSError, ValueError):
+        pass
+
+
 def memory_count() -> int:
     return len(list(_MEMORY_DIR.glob("*.json"))) if _MEMORY_DIR.exists() else 0
 
@@ -366,6 +415,8 @@ def _refund_hourly(uid: str) -> None:
 # 「重置」递增代数，进行中的旧请求回来后发现代数变了就丢弃结果
 _SESSION_LOCKS: dict[str, asyncio.Lock] = {}
 _SESSION_GEN: dict[str, int] = {}
+# 每个会话最近一次回复：msg_ids 用于撤回，messages 用于重摇时原样重生成
+_LAST_REPLY: dict[str, dict] = {}
 
 
 # ---------- 管理员：出厂占位不算数 + 运行时认领/追加 ----------
@@ -558,6 +609,8 @@ cmd_model_list = on_command("模型列表", aliases={"模型档案"},
                             rule=_cmd_gate, priority=4, block=True)
 cmd_model_switch = on_command("切换模型", aliases={"换模型"},
                               rule=_cmd_gate, priority=4, block=True)
+cmd_reshuffle = on_command("重摇", aliases={"重新生成"},
+                           rule=_cmd_gate, priority=4, block=True)
 
 msg_group = on_message(rule=Rule(_group_at_me), priority=10, block=True)
 msg_private = on_message(rule=Rule(_is_private), priority=50, block=True)
@@ -567,6 +620,7 @@ HELP_TEXT = (
     "· 私聊：直接发消息就能聊（发图也能看，需多模态模型）\n"
     "· 群聊：@我 + 你的问题\n"
     "· 重置 —— 清空当前会话的记忆\n"
+    "· 重摇 —— 撤回上一条回复重新生成（对答案不满意时用）\n"
     "· 联网 <问题> —— 联网搜索后回答（问新闻/天气会自动联网）\n"
     "· 叫我 <称呼> —— 设定我对你的称呼（叫我 重置 清除）\n"
     "· 语音开 / 语音关 —— 回复附带角色语音\n"
@@ -619,13 +673,21 @@ def _split_chunk(text: str, limit: int = 800) -> list[str]:
     return parts
 
 
-async def _send_chunks(matcher, answer: str) -> None:
-    """分段发送，块间随机小停顿（评审 P2-17），避免 QQ 吞长消息/刷屏感。"""
+async def _send_chunks(matcher, answer: str) -> list[int]:
+    """分段发送，块间随机小停顿（评审 P2-17）；返回每块的 message_id（重摇撤回用）。"""
     chunks = _split_chunk(answer)
+    ids: list[int] = []
     for i, chunk in enumerate(chunks):
         if i:
             await asyncio.sleep(random.uniform(0.2, 0.3))
-        await matcher.send(chunk)
+        sent = await matcher.send(chunk)
+        try:
+            mid = (sent or {}).get("message_id")
+            if mid:
+                ids.append(int(mid))
+        except Exception:   # noqa: BLE001 适配器不回 id 就放弃撤回能力
+            pass
+    return ids
 
 
 async def _do_chat(matcher, event: MessageEvent, q: str,
@@ -752,7 +814,11 @@ async def _do_chat(matcher, event: MessageEvent, q: str,
         # 记忆只存文字 + 轻量图片标记，不存 base64/签名 URL（评审 P1-5.7）
         memory_remember(key, q + (f" [图片×{len(images)}]" if images else ""), reply)
         try:
-            await _send_chunks(matcher, web_note + _terse(reply, q))
+            sent_ids = await _send_chunks(matcher, web_note + _terse(reply, q))
+            # 记录本次回复（撤回/重摇用）：id 给撤回，完整上下文给重摇重生成
+            _LAST_REPLY[key] = {"msg_ids": sent_ids, "messages": messages,
+                                "last_reply": reply}
+            _trim(_LAST_REPLY, 200)
         except ActionFailed as exc:
             # QQ 风控禁言(如 Ban state forbit write req)：发不出去不是崩溃，
             # 记清楚原因，等风控解除；记忆已存，不会丢这轮对话
@@ -1146,6 +1212,41 @@ async def _(matcher, event: MessageEvent, args: Message = CommandArg()):  # noqa
         await matcher.finish("用法：切换模型 <名字>（发「模型列表」看名单）")
     ok, msg_text = await _switch_model(name)
     await matcher.finish(("✅ " if ok else "❌ ") + msg_text)
+
+
+@cmd_reshuffle.handle()
+async def _(bot: Bot, matcher, event: MessageEvent):
+    """重摇：撤回上一条回复，用完全相同的上下文重新生成一次（采样随机出新版）。"""
+    key = _session_key(event)
+    info = _LAST_REPLY.get(key)
+    if not info or not info.get("messages"):
+        await matcher.finish("还没有可重摇的回复：先聊一句，不满意再发「重摇」")
+    lock = _SESSION_LOCKS.setdefault(key, asyncio.Lock())
+    if lock.locked():
+        await matcher.finish("我还在回上一条消息，稍等一下再重摇～")
+    async with lock:
+        try:   # 先生成：失败时原回复原封不动，零成本退出
+            new_reply = await _ensure_client().chat(info["messages"])
+        except DeepSeekError as exc:
+            await matcher.finish(f"😵 重摇失败：{exc.message}（原回复保留）")
+            return
+        for mid in info.get("msg_ids") or []:   # 撤回旧的（尽力而为：风控/超时就算了）
+            try:
+                await bot.call_api("delete_msg", message_id=mid)
+            except Exception:   # noqa: BLE001
+                pass
+        _memory_pop_last_reply(key)   # 旧答案出记忆，避免同一段剧情记两遍
+        try:
+            sent_ids = await _send_chunks(matcher, new_reply)
+        except ActionFailed as exc:
+            logger.warning("重摇新回复被QQ拦截: {}", str(exc)[:150])
+            _memory_append_assistant(key, new_reply)   # 发送失败也补记忆，内容不丢
+            await matcher.finish()
+            return
+        _LAST_REPLY[key] = {"msg_ids": sent_ids, "messages": info["messages"],
+                            "last_reply": new_reply}
+        _memory_append_assistant(key, new_reply)
+    await matcher.finish()
 
 
 @msg_private.handle()
