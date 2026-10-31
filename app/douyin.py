@@ -41,6 +41,7 @@ _state: dict = {"device": None, "dev_lock": threading.Lock(),
                 "thread": None, "stop": threading.Event(),
                 "pause": threading.Event(), "started_at": 0.0,
                 "plan_min": 0, "last_active": 0.0,
+                "paused_total": 0.0, "paused_at": 0.0,
                 "ai_failures": 0, "gen": 0, "last_error": "", "watchdog": None}
 
 _drift_warned: dict = {"key": ""}   # 评审 v4 P2-7：模型漂移告警去重
@@ -228,6 +229,12 @@ def _touch() -> None:
     _state["last_active"] = time.time()
 
 
+def _paused_seconds() -> float:
+    """会话累计暂停秒数（含进行中的暂停）：时长预算与每日账单都只按活跃时间算。"""
+    extra = time.time() - _state["paused_at"] if _state["paused_at"] else 0.0
+    return _state["paused_total"] + extra
+
+
 def _alive() -> bool:
     return bool(_state["thread"] and _state["thread"].is_alive())
 
@@ -242,7 +249,8 @@ def status() -> dict:
             _state["last_error"] = _state["last_error"] or "手机已断开，发「连接手机」重连"
     return {"running": _alive(), "paused": _state["pause"].is_set(),
             "connected": connected,
-            "elapsed_min": round((time.time() - _state["started_at"]) / 60, 1)
+            "elapsed_min": round(max(0.0, time.time() - _state["started_at"]
+                                     - _paused_seconds()) / 60, 1)
             if _alive() else 0,
             "plan_min": _state["plan_min"], "today_min": _daily_minutes(),
             "last_error": _state["last_error"]}
@@ -255,7 +263,9 @@ def _ai_client():
     from .envutil import ENV_FILE, load_env
     env = load_env(ENV_FILE)
     base_url = env.get("DEEPSEEK_BASE_URL") or "https://api.deepseek.com"
-    model = env.get("DEEPSEEK_MODEL") or "deepseek-chat"
+    # DOUYIN_MODEL：给抖音决策单独配多模态模型；不配则跟随聊天模型
+    model = ((env.get("DOUYIN_MODEL") or "").strip()
+             or (env.get("DEEPSEEK_MODEL") or "").strip() or "deepseek-chat")
     # 真机决策专用：短超时+零重试（评审 v3 P1-5：否则一次决策最长 135s，
     # stop 的 8 秒 join 必然超时变成僵尸会话）
     client = DeepSeekClient(
@@ -455,15 +465,27 @@ def _device_alive(dev) -> bool:
         return False
 
 
+def _vision_model_ok(model: str) -> bool:
+    """抖音决策要发截图给模型：DeepSeek 官方 API 全系是文本模型，直接拦下
+    （名字带 vl 的第三方多模态变体放行）。把"装好连好却每轮必败"提前到开刷前说清。"""
+    m = (model or "").lower()
+    return not ("deepseek" in m and "vl" not in m)
+
+
 def _ensure_awake(dev) -> bool:
-    """只负责亮屏+解锁（评审 v4 P1-1：不判断是否在抖音，打开抖音是主循环的事）。"""
+    """只负责亮屏+解锁，失败重试一次（评审 v4 P1-1：不判断是否在抖音，
+    打开抖音是主循环的事）。手机设了 PIN 锁时 unlock() 静默解不开，只能提示用户。"""
+    last_exc: Exception | None = None
     for _ in range(2):
         try:
             dev.screen_on()
             dev.unlock()
             return True
-        except Exception:
-            return False
+        except Exception as exc:   # noqa: BLE001
+            last_exc = exc
+            time.sleep(1.0)
+    if last_exc is not None:
+        logger.warning("亮屏/解锁失败: {}", str(last_exc)[:120])
     return False
 
 
@@ -495,11 +517,14 @@ def _ai_session_loop(minutes: int, gen: int) -> None:
     """
     stop = _state["stop"]
     session_start = time.time()   # 评审 v3 P2-16：快照，finally 用它算时长
-    deadline = session_start + minutes * 60
+    budget = minutes * 60         # 活跃时间预算：暂停期间不消耗（评审 v4 P2-3）
+
+    def _remaining() -> float:
+        return budget - (time.time() - session_start - _paused_seconds())
+
     consecutive_watch = 0
     try:
-        while not stop.is_set() and time.time() < deadline \
-                and gen == _state["gen"]:
+        while not stop.is_set() and _remaining() > 0 and gen == _state["gen"]:
             with _state["dev_lock"]:
                 dev = _state["device"]
             if dev is None or not _device_alive(dev):
@@ -530,8 +555,7 @@ def _ai_session_loop(minutes: int, gen: int) -> None:
                         _state["device"] = None
                 break
             _touch()
-            _pause_aware_sleep(min(random.uniform(4, 6),
-                                   max(0.1, deadline - time.time())))
+            _pause_aware_sleep(min(random.uniform(4, 6), max(0.1, _remaining())))
             if stop.is_set() or gen != _state["gen"]:
                 return
             try:
@@ -574,38 +598,44 @@ def _ai_session_loop(minutes: int, gen: int) -> None:
             if time.time() - _state.get("last_rest", session_start) \
                     > random.uniform(360, 720):
                 _state["last_rest"] = time.time()
-                rest = min(random.uniform(60, 180),
-                           max(0.0, deadline - time.time()))
+                rest = min(random.uniform(60, 180), max(0.0, _remaining()))
                 logger.info("抖音真机散步：休息 {:.0f}s", rest)
                 _pause_aware_sleep(rest)
     except Exception as exc:   # noqa: BLE001
         _state["last_error"] = str(exc)[:200]
     finally:
-        _add_daily(int((time.time() - session_start) / 60) or 1)
+        _add_daily(int(max(0.0, time.time() - session_start
+                           - _paused_seconds())) // 60 or 1)
         # 共享状态收尾（任务书 3.2）：无论正常结束/异常/用户停止，聊天侧都要如实
         assistant_state.session_stopped(_state["last_error"])
 
 
 def _start_watchdog() -> None:
-    if _state["watchdog"] and _state["watchdog"].is_alive():
-        return
+    """会话超时兜底：活跃时长超上限 5 分钟即 stop。
 
-    def _watch():
-        while True:
-            time.sleep(60)
-            # 真机模式不需要关浏览器；只做会话超时兜底
-            if _alive() and _state["started_at"] \
-                    and time.time() - _state["started_at"] > (MAX_SESSION_MIN + 5) * 60:
-                stop()
+    60 秒自续约的 Timer 链（评审：旧版 while True 线程永不退出）——
+    会话结束/被新会话取代时 gen 不匹配即退役；暂停期间活跃时长不涨，不会误杀。
+    """
+    def _watch(gen_now: int) -> None:
+        if not _alive() or gen_now != _state["gen"]:
+            return
+        if time.time() - _state["started_at"] - _paused_seconds() \
+                > (MAX_SESSION_MIN + 5) * 60:
+            stop()
+            return
+        _start_watchdog()
 
-    _state["watchdog"] = threading.Thread(target=_watch, daemon=True)
-    _state["watchdog"].start()
+    t = threading.Timer(60.0, _watch, args=(_state["gen"],))
+    t.daemon = True
+    _state["watchdog"] = t
+    t.start()
 
 
 # ---------- 对外操作 ----------
 
 def start(minutes: int) -> tuple[bool, str]:
-    # 评审 v4 P2-1：全程持 start_lock——并发「刷抖音」只有一路能开会话
+    # 慢操作（connect 可能要下载 adb）放在锁外：stop 不必陪着等；
+    # 开会话的收尾在第二段锁里完成——与 stop 的 set+gen++ 互斥，停止请求不可能被吞
     with _state["start_lock"]:
         with _state["dev_lock"]:
             if _state["thread"] and not _state["thread"].is_alive():
@@ -621,14 +651,21 @@ def start(minutes: int) -> tuple[bool, str]:
         env = load_env(ENV_FILE)
         if not (env.get("DEEPSEEK_API_KEY") or "").strip():
             return False, "还没填 API Key：控制台 → 模型配置"
-        if not (env.get("DEEPSEEK_MODEL") or "").strip():
+        model = ((env.get("DOUYIN_MODEL") or "").strip()
+                 or (env.get("DEEPSEEK_MODEL") or "").strip())
+        if not model:
             return False, "还没设置模型：控制台 → 模型配置"
+        if not _vision_model_ok(model):
+            return False, (f"当前模型 {model} 不支持看图：抖音决策需要多模态模型"
+                           "（gemini / gpt-4o / qwen-vl / glm-4v 系列），"
+                           "请在控制台换模型，或在 .env 用 DOUYIN_MODEL 单独配")
         gen_before = _state["gen"]
-        ok, msg = connect()
-        if not ok:
-            return False, msg
+    ok, msg = connect()
+    if not ok:
+        return False, msg
+    with _state["start_lock"]:
         if _state["gen"] != gen_before:
-            # connect 耗时期间用户按了停止：尊重它，不要 clear 掉（评审 v4 P2-1）
+            # connect 耗时期间用户按了停止（stop 会递增 gen）：尊重它（评审 v4 P2-1）
             return False, "连接期间收到停止指令，已取消本次开刷"
         if _alive():
             return False, "已经在刷了，发「抖音暂停」或「停止抖音」"
@@ -638,6 +675,8 @@ def start(minutes: int) -> tuple[bool, str]:
         _state["plan_min"] = minutes
         _state["last_error"] = ""
         _state["ai_failures"] = 0
+        _state["paused_total"] = 0.0
+        _state["paused_at"] = 0.0
         _state["gen"] = _state["gen"] + 1   # 新会话作废一切旧循环（评审 v3 P1-3）
         _recent.clear()                     # 评审 v3 P2-15：决策记录不跨会话
         _state["last_rest"] = time.time()   # 评审 v3 P3：休息计时随会话重置
@@ -653,9 +692,12 @@ def start(minutes: int) -> tuple[bool, str]:
 
 
 def stop() -> tuple[bool, str]:
-    _state["stop"].set()
-    _state["gen"] = _state["gen"] + 1   # 评审 v3 P1-3：代数作废，决策中的旧循环不再执行动作
-    thread = _state["thread"]
+    # set+gen++ 与 start 的 gen 校验/clear 共用 start_lock：检查与清事件之间
+    # 不可能插入停止请求（评审 v4 P2-1 收尾）
+    with _state["start_lock"]:
+        _state["stop"].set()
+        _state["gen"] = _state["gen"] + 1   # 评审 v3 P1-3：代数作废，决策中的旧循环不再执行动作
+        thread = _state["thread"]
     if thread and thread.is_alive():
         thread.join(timeout=8)
     if thread is not None and thread.is_alive():
@@ -669,12 +711,17 @@ def stop() -> tuple[bool, str]:
 def pause() -> tuple[bool, str]:
     if not _alive():
         return False, "现在没在刷"
+    if not _state["pause"].is_set():
+        _state["paused_at"] = time.time()   # 暂停时间不计入时长与今日账单
     _state["pause"].set()
     assistant_state.set_paused(True)
     return True, "已暂停（抖音还在手机上播着，可随时「抖音继续」）"
 
 
 def resume() -> tuple[bool, str]:
+    if _state["pause"].is_set() and _state["paused_at"]:
+        _state["paused_total"] += time.time() - _state["paused_at"]
+        _state["paused_at"] = 0.0
     _state["pause"].clear()
     assistant_state.set_paused(False)
     return True, "继续刷" if _alive() else "会话已结束，重新发「刷抖音」"

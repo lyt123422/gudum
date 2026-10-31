@@ -52,6 +52,16 @@ def _normalize(task: dict) -> dict:
     return out
 
 
+def clean_name(name: str) -> str:
+    """任务名清洗：非法字符换 _，限长（add_task 与 QQ 指令侧共用）。"""
+    return _NAME_RE.sub("_", (name or "").strip())[:MAX_NAME_LEN]
+
+
+def minute_mark(now: float | None = None) -> int:
+    """当前分钟的全局标记（本地时区）：到期判定与防重发共用，单一实现。"""
+    return int(time.mktime(time.localtime(now))) // 60
+
+
 def load_tasks() -> list[dict]:
     """读任务定义（2 秒缓存）。"""
     now = time.monotonic()
@@ -144,7 +154,7 @@ def merged_tasks() -> list[dict]:
 def due_tasks(now: float | None = None) -> list[dict]:
     """当前分钟应触发、且本分钟尚未触发过的任务（不补发停机期间的任务）。"""
     ts = time.localtime(now)
-    minute_mark = int(time.mktime(ts)) // 60
+    mark = minute_mark(now)
     runtime = load_runtime()
     due = []
     for task in load_tasks():
@@ -153,7 +163,7 @@ def due_tasks(now: float | None = None) -> list[dict]:
         fields = cron_fields(task["cron"])
         if not fields or not cron_matches(fields, ts):
             continue
-        if int(runtime.get(task["name"], {}).get("last_run") or 0) == minute_mark:
+        if int(runtime.get(task["name"], {}).get("last_run") or 0) == mark:
             continue
         due.append(task)
     return due
@@ -180,7 +190,7 @@ def _target_ok(target: str) -> bool:
 
 def add_task(name: str, cron: str, content: str, target: str,
              task_type: str = "group", enabled: bool = True) -> tuple[bool, str]:
-    name = _NAME_RE.sub("_", (name or "").strip())[:MAX_NAME_LEN]
+    name = clean_name(name)
     cron = (cron or "").strip()
     content = (content or "").strip()
     target = (target or "").strip()
@@ -253,6 +263,7 @@ def remove_task(name: str) -> tuple[bool, str]:
     _mutate(apply)
     if not found["ok"]:
         return False, f"没有叫「{name}」的任务"
+    clear_runtime(name)   # 运行结果一并清掉，不留永久残留（clear_runtime 由此复活）
     return True, f"已删除「{name}」"
 
 

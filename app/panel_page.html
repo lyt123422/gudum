@@ -163,7 +163,7 @@ pre{background:#0f172a;color:#bbf7d0;font-size:12px;padding:14px;border-radius:1
    <label>API Key</label><input id="f-key" placeholder="sk-…（Ollama 本地随便填非空）" type="password">
    <label>模型</label><input id="f-model" placeholder="deepseek-chat">
    <div class="row">
-    <button class="green" onclick="saveCfg()">💾 保存并重启机器人</button>
+    <button class="green" onclick="saveCfg('model')">💾 保存并重启机器人</button>
     <button class="ghost" onclick="testApi()">🔌 测试连通</button>
    </div>
    <div class="msg" id="cfg-msg"></div>
@@ -183,12 +183,23 @@ pre{background:#0f172a;color:#bbf7d0;font-size:12px;padding:14px;border-radius:1
     👥 <b>所有人可用</b>：私聊/群@聊天 · 重置自己的记忆 · 人设列表 · 帮助
    </div>
    <div class="row">
-    <button class="green" onclick="saveCfg()">💾 保存</button>
+    <button class="green" onclick="saveCfg('qq')">💾 保存</button>
     <button class="ghost" onclick="adoptQq()">📥 采用登录账号</button>
+    <button class="ghost" onclick="clearPass()">🔑 清除免扫码密码</button>
    </div>
    <div class="msg" id="qq-msg"></div>
   </div>
- </div>
+  <div class="card">
+   <h3>🔄 QQ 换号</h3>
+   <div class="desc" id="acc-state">加载中…</div>
+   <div id="acc-list"></div>
+   <div class="row"><button class="ghost" onclick="scanLogin()">📲 扫码登录其他号</button></div>
+   <div class="tip">⚠ 二维码是「谁扫谁登录」：出码后<b>用目标账号的手机扫</b>，别拿当前号的手机扫。
+    目标号快登有效会直接连上；失效/没登录过才出新二维码（约 2 分钟有效，过期重切一次）。
+    ⚠ 不指定目标号的"纯扫码"没有意义：NapCat 发现本机有快登记录会直接自动登录当前号，二维码不出现。</div>
+   <div class="msg" id="acc-msg"></div>
+  </div>
+</div>
 
  <!-- 人设管理 -->
  <div class="page" id="pg-persona">
@@ -316,11 +327,7 @@ pre{background:#0f172a;color:#bbf7d0;font-size:12px;padding:14px;border-radius:1
   </div>
  </div>
 
-
-
-> 只用现有 class（card / step / pl-item / tip / desc / row / button），不含 JS/API。
-
- <!-- 反代 -->
+<!-- 反代 -->
  <div class="page" id="pg-proxy">
   <div class="card">
    <h3>🔀 反代 · WorkBuddy 网关</h3>
@@ -533,7 +540,10 @@ async function refresh(){
   $('b-ns').disabled=S.napcat_running;$('b-nx').disabled=!S.napcat_running;
   $('run-bot-state').textContent=S.bot_running?'✅ 运行中（PID 监听 127.0.0.1:8081）':'⏹ 已停止';
   $('run-nc-state').textContent=S.napcat_running?(S.qq_connected?'✅ 运行中 · QQ 已登录':'🟡 运行中 · 等待扫码'):'⏹ 已停止';
-  const showQr=S.napcat_running&&!S.qq_connected;
+  // 幽灵码过滤：启动 8 秒内 NapCat 快登刷新会顺手出一张码（不是给你扫的，
+  // 登录成功即消失）；只有 runner 检测到「快登失败→二维码回落」或启动超 8 秒
+  // 仍未连接，才真正展示扫码区
+  const showQr=S.napcat_running&&!S.qq_connected&&(S.qr_waiting||(S.napcat_uptime||0)>8);
   $('qr').style.display=showQr?'block':'none';
   if(showQr){
    const left=Math.max(0,Math.round((qrDeadline-Date.now())/1000));
@@ -597,23 +607,43 @@ function renderProvs(){const box=$('provs');box.innerHTML='';
   d.textContent=k+(k===liveProv?' ●':'');
   d.title=k===liveProv?'当前生效':'点击载入该提供商的档案';
   d.onclick=()=>fillProvider(k);box.appendChild(d)})}
-async function saveCfg(){
- msg('cfg-msg','保存中…','');
- const body={provider:curProv,base_url:$('f-base').value,model:$('f-model').value,
-  napcat_account:$('f-account').value,superuser:$('f-su').value};
- const k=$('f-key').value;
- if(k&&k!==maskedKey)body.api_key=k;          // 掩码/空=不修改已存 Key
+async function saveCfg(part){
+ // 审计 F4：QQ 卡片与模型卡片分开保存，不再互相夹带字段
+ // （原来一个保存函数把 provider/base_url/model 一起送上，改 QQ 号也会动模型档案）
+ const body={};
+ if(part==='model'){
+  msg('cfg-msg','保存中…','');
+  body.provider=curProv;body.base_url=$('f-base').value;body.model=$('f-model').value;
+  const k=$('f-key').value;
+  if(k&&k!==maskedKey)body.api_key=k;          // 掩码/空=不修改已存 Key
+ }else{
+  msg('qq-msg','保存中…','');
+  body.napcat_account=$('f-account').value;body.superuser=$('f-su').value;
+ }
  if($('f-pass').value)body.napcat_password=$('f-pass').value;
  const r=await fetch('/api/save',{method:'POST',headers:{'Content-Type':'application/json'},
   body:JSON.stringify(body)});
  const j=await r.json();
- const m=j.ok?('✅ 已保存'+(j.bot_restarted?'，机器人已重启生效':'（机器人未运行，下次启动生效）')):'❌ '+(j.error||'保存失败');
- msg('cfg-msg',m,j.ok?'ok':'err');msg('qq-msg',m,j.ok?'ok':'err');
+ const okm=part==='model'?'cfg-msg':'qq-msg';
+ const m=j.ok?('✅ 已保存'+(part==='model'
+   ?(j.bot_restarted?'，机器人已重启生效':'（机器人未运行，下次启动生效）'):''))
+  :'❌ '+(j.error||'保存失败');
+ msg(okm,m,j.ok?'ok':'err');
+ if(j.note)msg(okm,m+'　'+j.note,j.ok?'ok':'err');
  if(j.ok){cfgDirty=false;
-  if(curProv)PROFILES[curProv]={base_url:$('f-base').value,api_key:$('f-key').value,
-   model:$('f-model').value};
+  if(part==='model'&&curProv)PROFILES[curProv]={base_url:$('f-base').value,
+   api_key:$('f-key').value,model:$('f-model').value};
   loadProviders();   // 评审 P0-1：刷新客户端档案缓存（掩码已变）
-  loadCfg(true)}}   // 保存成功后才回填并同步提供商高亮
+  if(part==='model')loadCfg(true);   // 保存成功后才回填并同步提供商高亮
+  if(part==='qq'){$('f-pass').value='';   // 审计 F5：明文密码不留在输入框
+   $('pass-state').textContent='（已设置，免扫码）'}}}
+async function clearPass(){
+ const j=await(await fetch('/api/save',{method:'POST',
+  headers:{'Content-Type':'application/json'},
+  body:JSON.stringify({napcat_password_clear:true})})).json();
+ msg('qq-msg',j.ok?'✅ 已清除免扫码密码，下次启动协议端走扫码':'❌ '+(j.error||'失败'),
+  j.ok?'ok':'err');
+ if(j.ok){$('f-pass').value='';$('pass-state').textContent=''}}
 async function testApi(){
  msg('cfg-msg','正在调用模型测试…','');
  const body={base_url:$('f-base').value,model:$('f-model').value};
@@ -664,7 +694,9 @@ function renderPersonas(){const box=$('p-list');box.innerHTML='';
 async function usePersona(){if(!selP)return;
  const j=await(await fetch('/api/persona/switch',{method:'POST',
   headers:{'Content-Type':'application/json'},body:JSON.stringify({name:selP})})).json();
- msg('p-msg',j.ok?`✅ 已切换为「${selP}」，立即生效`:'❌ '+(j.error||'切换失败'),j.ok?'ok':'err');
+ msg('p-msg',j.ok?`✅ 已切换为「${selP}」，立即生效`
+   +(j.memory_cleared!=null?`，🧹 已清空 ${j.memory_cleared} 个会话记忆`:'')
+   :'❌ '+(j.error||'切换失败'),j.ok?'ok':'err');
  await loadPersonas();loadCfg()}
 async function savePersona(){if(!selP)return;
  const j=await(await fetch('/api/persona/save',{method:'POST',
@@ -716,6 +748,52 @@ async function adoptQq(){
   body:JSON.stringify({qq:S.logged_in_qq})})).json();
  msg('qq-msg',j.ok?('✅ 已把配置账号采用为 '+j.qq):'❌ '+(j.error||'失败'),j.ok?'ok':'err');
  if(j.ok){$('f-account').value=j.qq;refresh()}}
+
+/* ---------- QQ 换号 ---------- */
+let ACC={accounts:[],configured:'',online:''};
+async function loadAccounts(){
+ try{ACC=await(await fetch('/api/napcat/accounts')).json();renderAccounts()}catch(e){}}
+function renderAccounts(){
+ const box=$('acc-list');if(!box)return;box.innerHTML='';
+ if(ACC.online)
+  $('acc-state').textContent='当前在线：'+ACC.online
+   +(ACC.configured&&ACC.online!==ACC.configured
+     ?('　⚠ 配置写的却是 '+ACC.configured+'（点下方「切换」对齐）'):'　✓ 与配置一致');
+ else $('acc-state').textContent='当前未登录 · 配置账号：'+(ACC.configured||'（未配置）');
+ ACC.accounts.forEach(a=>{
+  const row=document.createElement('div');row.className='pl-item';
+  const left=document.createElement('div');
+  const nm=document.createElement('div');nm.className='nm';nm.textContent=a.qq;
+  const tags=[];
+  if(a.online)tags.push('● 在线');
+  if(a.configured)tags.push('配置中');
+  const ds=document.createElement('div');ds.className='ds';
+  ds.textContent=tags.length?('· '+tags.join(' · ')):'· 有历史登录记录（快登可能已失效）';
+  left.append(nm,ds);row.append(left);
+  if(!a.configured){
+   const btns=document.createElement('div');btns.className='pl-btns';
+   const sw=document.createElement('button');sw.textContent='切换到此号';
+   sw.onclick=()=>switchAcc(a.qq);btns.append(sw);row.append(btns);}
+  box.appendChild(row)})}
+async function switchAcc(qq){
+ if(!confirm('确定换到 '+qq+' ？协议端会重启：快登有效直接连上；失效会出新二维码'
+  +'——记得用 '+qq+' 的手机扫。'))return;
+ msg('acc-msg','⏳ 正在切换并重启协议端（约 10 秒）…','');
+ const j=await(await fetch('/api/napcat/switch',{method:'POST',
+  headers:{'Content-Type':'application/json'},
+  body:JSON.stringify({qq:qq})})).json();
+ msg('acc-msg',j.ok?('✅ '+(j.note||'已切换')):'❌ '+(j.error||'失败'),j.ok?'ok':'err');
+ if(j.ok){$('f-account').value=qq;loadAccounts();setTimeout(refresh,4000)}}
+async function scanLogin(){
+ const qq=(prompt('要扫码登录哪个 QQ 号？\n（以它为目标重启协议端：快登有效直接连上，失效自动出二维码，用这个号的手机扫）')||'').trim();
+ if(!qq)return;
+ if(!/^\d{5,}$/.test(qq)){msg('acc-msg','❌ QQ 号必须是纯数字','err');return}
+ msg('acc-msg','⏳ 正在以 '+qq+' 为目标重启协议端（顺带清理残留实例）…','');
+ const j=await(await fetch('/api/napcat/switch',{method:'POST',
+  headers:{'Content-Type':'application/json'},
+  body:JSON.stringify({qq:qq})})).json();
+ msg('acc-msg',j.ok?('✅ '+(j.note||'已切换')):'❌ '+(j.error||'失败'),j.ok?'ok':'err');
+ if(j.ok){$('f-account').value=qq;loadAccounts();setTimeout(refresh,4000)}}
 
 /* ---------- 破甲（独立分类） ---------- */
 let JB={enabled:false,paused:false,active:false,preset:'',presets:[]};
@@ -1007,7 +1085,8 @@ async function applyProxyModel(){
   await loadProxy()}else msg('px-msg','❌ '+(j.error||''),'err');
  loadCfg(true)}
 loadProviders().then(()=>loadCfg(true));loadPersonas();loadPlugins();loadJailbreak();
-loadSched();refresh();loadLogs();
-setInterval(refresh,3000);setInterval(loadLogs,5000);setInterval(pollPersonaName,15000);setInterval(loadProxy,5000);
+loadSched();refresh();loadLogs();loadAccounts();
+setInterval(refresh,3000);setInterval(loadLogs,5000);setInterval(pollPersonaName,15000);
+setInterval(loadProxy,5000);setInterval(loadAccounts,8000);
 </script><div id="toast"></div>
 </body></html>

@@ -38,22 +38,42 @@ BOT_OUT = ROOT / "data" / "panel_bot.log"
 NAPCAT_OUT = ROOT / "data" / "panel_napcat.log"
 
 _procs: dict[str, subprocess.Popen | None] = {"bot": None, "napcat": None}
+_spawn_ts: dict[str, float] = {"bot": 0.0, "napcat": 0.0}   # 滤幽灵码：启动 8 秒内的码不展示
+NAPCAT_STATE_FILE = ROOT / "data" / "napcat_login_state.json"   # runner 输出检测落盘
 
 # 模型提供商预设与分档档案（设计参考 AstrBot「模型提供商」页：各家独立配置）
 PROXY_PROVIDER = "WorkBuddy反代"   # 反代激活时的模型源档案名（评审 v4 反代方案）
 
 PROVIDER_PRESETS: dict[str, dict | None] = {
     "DeepSeek": {"base_url": "https://api.deepseek.com", "model": "deepseek-chat"},
-    "智谱GLM": {"base_url": "https://open.bigmodel.cn/api/paas/v4", "model": "glm-4-flash"},
+    "智谱GLM": {"base_url": "https://open.bigmodel.cn/api/paas/v4", "model": "glm-4.7-flash"},
     "通义千问": {"base_url": "https://dashscope.aliyuncs.com/compatible-mode/v1",
                 "model": "qwen-plus"},
-    "Kimi": {"base_url": "https://api.moonshot.cn/v1", "model": "moonshot-v1-8k"},
+    # moonshot-v1-* 已于 2026-08-31 下线（Kimi 官方模型列表），预设换 kimi-k3.1-pro
+    "Kimi": {"base_url": "https://api.moonshot.cn/v1", "model": "kimi-k3.1-pro"},
     "硅基流动": {"base_url": "https://api.siliconflow.cn/v1",
-                "model": "deepseek-ai/DeepSeek-V3"},
-    "Ollama本地": {"base_url": "http://localhost:11434/v1", "model": "qwen2.5:7b"},
+                "model": "deepseek-ai/DeepSeek-V3.2"},
+    "Ollama本地": {"base_url": "http://localhost:11434/v1", "model": "qwen3:8b"},
     "自定义": None,
 }
 PROVIDERS_FILE = ROOT / "data" / "providers.json"
+MEM_DIR = ROOT / "data" / "memory"
+
+
+def _clear_all_memory_files() -> int:
+    """清空全部会话记忆文件（面板侧直删；与内核 chat.memory_clear_all 同义）。
+
+    换人格=换说话方式：旧人设的回复留在记忆里会继续影响新人格。
+    """
+    cleared = 0
+    if MEM_DIR.exists():
+        for f in MEM_DIR.glob("*.json"):
+            try:
+                f.unlink()
+                cleared += 1
+            except OSError:
+                pass
+    return cleared
 
 
 def _load_profiles() -> dict[str, dict]:
@@ -189,8 +209,21 @@ def _stop(name: str) -> None:
     _procs[name] = None
 
 
+def _rotate_log(outfile: Path, max_bytes: int = 5 * 1024 * 1024) -> None:
+    """面板托管的进程日志无轮转会无限膨胀（实测 840KB/两周）：超 5MB 留一代 .old。"""
+    try:
+        if outfile.exists() and outfile.stat().st_size > max_bytes:
+            old = outfile.with_suffix(outfile.suffix + ".old")
+            if old.exists():
+                old.unlink()
+            outfile.rename(old)
+    except OSError:
+        pass   # 文件被占用（进程还在写）就等下次启动再轮转
+
+
 def _spawn(name: str, module: str, outfile: Path) -> None:
     _stop(name)
+    _rotate_log(outfile)
     with outfile.open("a", encoding="utf-8") as fh:
         fh.write(f"\n===== {datetime.now():%Y-%m-%d %H:%M:%S} 启动 =====\n")
     fh = outfile.open("a", encoding="utf-8")
@@ -199,6 +232,7 @@ def _spawn(name: str, module: str, outfile: Path) -> None:
         cwd=ROOT, stdout=fh, stderr=subprocess.STDOUT,
         creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
     fh.close()   # 父进程句柄立即关闭（子进程有自己的继承副本），防句柄泄漏
+    _spawn_ts[name] = time.time()
 
 
 # ---------- LLM 连通测试 ----------
@@ -315,21 +349,31 @@ async def api_save(request: Request) -> dict:
         base_url = values.get("DEEPSEEK_BASE_URL", "")
         if not base_url:
             return {"ok": False, "error": "Base URL 不能为空"}
+        # 配置审计 F1：归属按地址不按前端高亮——高亮 DeepSeek 却填了 GLM 地址时，
+        # 存进 GLM 档案，而不是把 GLM 的 Key/地址覆盖进 DeepSeek 档案
+        home = next((name for name, preset in PROVIDER_PRESETS.items()
+                     if preset and preset["base_url"].rstrip("/")
+                     == base_url.rstrip("/")), None)
+        if home and home != provider:
+            provider = home
         profiles = _load_profiles()
         old_profile = profiles.get(provider, {})
         requested_base = base_url.rstrip("/")
         old_base = str(old_profile.get("base_url", "")).rstrip("/")
+        is_local = base_url.startswith(("http://127.0.0.1", "http://localhost"))
         # 评审 v3 P0-1：换 Base URL 不带新 Key = 把旧 Key 发往新地址，拒绝；
-        # 只有 base 与档案一致时才允许沿用档案 Key（正常切换流程）
-        if requested_base != old_base and not values.get("DEEPSEEK_API_KEY"):
+        # 本地地址（Ollama）无需 Key，放行但清掉旧 Key（审计 F3：既放行又不外带）
+        keyless_local_switch = (requested_base != old_base
+                                and not values.get("DEEPSEEK_API_KEY") and is_local)
+        if requested_base != old_base and not values.get("DEEPSEEK_API_KEY") \
+                and not is_local:
             return {"ok": False, "error": "更换 Base URL 时必须同时填写 API Key"}
         old_key = str(old_profile.get("api_key", ""))
         had_masked = bool(old_key and _looks_masked(old_key))
         if had_masked:
             old_key = ""   # 评审 v3 P2-7：历史掩码 Key 不可复用
         if not values.get("DEEPSEEK_API_KEY") and requested_base == old_base \
-                and not old_key and not base_url.startswith(("http://127.0.0.1",
-                                                             "http://localhost")):
+                and not old_key and not is_local:
             # 评审 v4 P2-10：区分"没 Key"和"掩码 Key"
             if had_masked:
                 return {"ok": False,
@@ -339,7 +383,6 @@ async def api_save(request: Request) -> dict:
         new_key = values.get("DEEPSEEK_API_KEY") or \
             (old_key if requested_base == old_base else "")
         new_model = values.get("DEEPSEEK_MODEL") or old_profile.get("model", "")
-        is_local = base_url.startswith(("http://127.0.0.1", "http://localhost"))
         if not new_key and not is_local:
             return {"ok": False,
                     "error": "该提供商还没有可用的 API Key，请先填写（本地 Ollama 除外）"}
@@ -347,38 +390,71 @@ async def api_save(request: Request) -> dict:
                               "model": new_model}
         _save_profiles(profiles)
         values["DEEPSEEK_BASE_URL"] = base_url
-        values["DEEPSEEK_API_KEY"] = new_key
+        if new_key:
+            values["DEEPSEEK_API_KEY"] = new_key
+        elif keyless_local_switch:
+            # 换到本地无 Key 服务：清空 .env 旧 Key，绝不把它发往新地址
+            values["DEEPSEEK_API_KEY"] = ""
         values["DEEPSEEK_MODEL"] = new_model
     elif values.get("DEEPSEEK_BASE_URL"):
-        # 评审 v3 P0-1：非提供商路径同样不许"换地址留旧 Key"
+        # 评审 v3 P0-1 + 审计 F3：换地址不带 Key → 本地地址放行但清掉旧 Key，
+        # 非本地地址拒绝——两条路都保证旧 Key 绝不外带
         new_base = values["DEEPSEEK_BASE_URL"].rstrip("/")
         old_base = before.get("DEEPSEEK_BASE_URL", "").rstrip("/")
         if new_base != old_base and not values.get("DEEPSEEK_API_KEY"):
-            return {"ok": False, "error": "更换 Base URL 时必须同时填写 API Key"}
+            if new_base.startswith(("http://127.0.0.1", "http://localhost")):
+                values["DEEPSEEK_API_KEY"] = ""
+            else:
+                return {"ok": False, "error": "更换 Base URL 时必须同时填写 API Key"}
     if admin_list:
         values["SUPERUSERS"] = json.dumps(admin_list, ensure_ascii=False)
+    if body.get("napcat_password_clear"):
+        values["NAPCAT_QUICK_PASSWORD"] = ""   # 审计 F5：留了清除入口，否则密码无法撤掉
     if proxy_on and any(k in values for k in
                         ("DEEPSEEK_BASE_URL", "DEEPSEEK_API_KEY",
                          "DEEPSEEK_MODEL")):
-        # 评审 v4 反代互斥：直连模型改动只存档案，模型源保持反代
-        if provider and provider != PROXY_PROVIDER:
-            profiles = _load_profiles()
-            old_profile = profiles.get(provider, {})
-            profiles[provider] = {
-                "base_url": values.get("DEEPSEEK_BASE_URL")
-                or old_profile.get("base_url", ""),
-                "api_key": values.get("DEEPSEEK_API_KEY")
-                or old_profile.get("api_key", ""),
-                "model": values.get("DEEPSEEK_MODEL")
-                or old_profile.get("model", "")}
-            _save_profiles(profiles)
-            proxy_note = "🔀 反代运行中：直连配置已存入档案（未激活），停止反代后生效"
-        elif not provider:
-            proxy_note = ("🔀 反代运行中：直连模型改动已忽略"
-                          "（选提供商胶囊可存为档案，或停止反代）")
-        values = {k: v for k, v in values.items()
-                  if k not in ("DEEPSEEK_BASE_URL", "DEEPSEEK_API_KEY",
-                               "DEEPSEEK_MODEL")}
+        # 评审 v4 反代互斥 + 审计 F2：直连改动只存档案，模型源保持反代；
+        # 反代自身地址的回存（模型页显示的就是反代源）不算直连修改
+        direct = {k: v for k, v in values.items()
+                  if k in ("DEEPSEEK_BASE_URL", "DEEPSEEK_API_KEY",
+                           "DEEPSEEK_MODEL")}
+        if direct.get("DEEPSEEK_BASE_URL", "").rstrip("/") \
+                == proxy_manager.base_url().rstrip("/"):
+            direct.pop("DEEPSEEK_BASE_URL", None)
+        if direct:
+            if not provider or provider == PROXY_PROVIDER:
+                # body 没带 provider（没点胶囊）：按地址归属补存，不再静默丢弃
+                home = next((name for name, preset in PROVIDER_PRESETS.items()
+                             if preset and preset["base_url"].rstrip("/")
+                             == direct.get("DEEPSEEK_BASE_URL", "").rstrip("/")),
+                            None) or "自定义"
+                profiles = _load_profiles()
+                old_profile = profiles.get(home, {})
+                profiles[home] = {
+                    "base_url": direct.get("DEEPSEEK_BASE_URL")
+                    or old_profile.get("base_url", ""),
+                    "api_key": direct.get("DEEPSEEK_API_KEY")
+                    or old_profile.get("api_key", ""),
+                    "model": direct.get("DEEPSEEK_MODEL")
+                    or old_profile.get("model", "")}
+                _save_profiles(profiles)
+                provider = home
+            # 审计 F2：同步刷新“切回直连”快照——反代一停，恢复的就是用户最新改的
+            # 直连配置，而不是激活反代那天的旧 Key
+            cfg_now = proxy_manager.config()
+            prev = dict(cfg_now.get("previous") or {})
+            for env_key, snap_key in (("DEEPSEEK_BASE_URL", "base_url"),
+                                      ("DEEPSEEK_API_KEY", "api_key"),
+                                      ("DEEPSEEK_MODEL", "model")):
+                if direct.get(env_key):
+                    prev[snap_key] = direct[env_key]
+            cfg_now["previous"] = prev
+            proxy_manager.save_config(cfg_now)
+            proxy_note = ("🔀 反代运行中：直连配置已存入「" + provider + "」档案"
+                          "并同步切回快照，停止反代后生效")
+            values = {k: v for k, v in values.items()
+                      if k not in ("DEEPSEEK_BASE_URL", "DEEPSEEK_API_KEY",
+                                   "DEEPSEEK_MODEL")}
     try:
         update_env(values)
     except EnvValueError as exc:
@@ -451,7 +527,8 @@ async def api_persona_switch(request: Request) -> dict:
     if name not in personas.load_all():
         return {"ok": False, "error": "没有这个人设"}
     personas.set_active(name)
-    return {"ok": True, "name": name}
+    cleared = _clear_all_memory_files()
+    return {"ok": True, "name": name, "memory_cleared": cleared}
 
 
 _WINDOWS_RESERVED = {"CON", "PRN", "AUX", "NUL", "COM1", "COM2", "COM3", "COM4",
@@ -714,8 +791,8 @@ async def api_plugin_uninstall(request: Request) -> dict:
 @app.get("/api/proxy")
 async def api_proxy() -> dict:
     """反代状态 + 模型列表（Key 只用不回传）。"""
-    st = proxy_manager.status()
-    cfg = proxy_manager.config()
+    st = await asyncio.to_thread(proxy_manager.status)
+    cfg = await asyncio.to_thread(proxy_manager.config)
     key = cfg.get("api_key") or proxy_manager.key_from_settings()
     health = await proxy_manager.health() if st["running"] else None
     accounts = int((health or {}).get("accounts") or 0)
@@ -742,7 +819,7 @@ async def api_proxy() -> dict:
 @app.post("/api/proxy/config")
 async def api_proxy_config(request: Request) -> dict:
     body = await _body_json(request)
-    cfg = proxy_manager.config()
+    cfg = await asyncio.to_thread(proxy_manager.config)
     path = str(body.get("path") or "").strip()
     if path:
         found = await asyncio.to_thread(workbuddy_setup.locate, path)
@@ -788,7 +865,7 @@ async def api_proxy_start() -> dict:
                 "install": await asyncio.to_thread(
                     workbuddy_setup.status,
                     proxy_manager.config().get("path"))}
-    cfg = proxy_manager.config()
+    cfg = await asyncio.to_thread(proxy_manager.config)
     key = cfg.get("api_key") or proxy_manager.key_from_settings()
     health = await proxy_manager.health()
     accounts_ready = int((health or {}).get("accounts_ready") or 0)
@@ -913,7 +990,7 @@ async def api_persona_save(request: Request) -> dict:
     if not parsed.text:
         return {"ok": False, "error": "缺少 [人设] 段"}
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(raw if raw.endswith("\n") else raw + "\n", encoding="utf-8")
+    _atomic_write(path, raw if raw.endswith("\n") else raw + "\n")
     personas.invalidate()   # 面板进程自己的缓存也要失效
     return {"ok": True, "name": parsed.name}
 
@@ -935,6 +1012,7 @@ async def api_persona_delete(request: Request) -> dict:
         fallback = next(iter(sorted(library)))
         if fallback != name:
             personas.set_active(fallback)
+            _clear_all_memory_files()   # 回落=换了人格：记忆一并带走
     return {"ok": True}
 
 
@@ -1062,24 +1140,148 @@ async def api_bot_stop() -> dict:
     return {"ok": True}
 
 
-@app.post("/api/napcat/start")
-async def api_napcat_start() -> dict:
-    # 先按当前 .env 刷新 NapCat 反向 WS 配置（令牌/端口/换号后自动同步）
+def _kill_orphan_napcat() -> None:
+    """清理不受面板管理的协议端残留（按命令行匹配进程树）。
+
+    旧面板死亡/重复启动会留下双实例：两个 NapCat 同时登一个号会互踢，
+    内核日志表现就是连续 "WebSocket closed by peer"（2026-10-31 11:47 实测）。
+    powershell 自身命令行也含匹配词，用 $PID 排除。
+    """
+    ps = ("Get-CimInstance Win32_Process | Where-Object { "
+          "$_.ProcessId -ne $PID -and $_.CommandLine -match "
+          "'app\\.napcat_runner|napcat\\\\node\\.exe' } | ForEach-Object { "
+          "& taskkill /F /T /PID $_.ProcessId 2>$null | Out-Null }")
+    try:
+        subprocess.run(["powershell", "-NoProfile", "-Command", ps],
+                       capture_output=True, timeout=15)
+    except Exception:   # noqa: BLE001
+        pass
+
+
+async def _restart_napcat(account: str = "", qr: bool = False) -> None:
+    """停止 → 清孤儿实例 → 按当前 .env 重生成反向 WS 配置 → 拉起协议端。
+
+    account 必须是目标号：NapCat 以 -q <目标号> 启动，快登有效直接连上，
+    失效/无记录自动回落到二维码（谁扫登录谁）。
+    """
+    await asyncio.to_thread(_stop, "napcat")
+    await asyncio.to_thread(_kill_orphan_napcat)
     await asyncio.to_thread(
         subprocess.run,
         [str(VENV_PY), "-m", "app.napcat_config"], cwd=ROOT, capture_output=True)
+    spec = f"app.napcat_runner --account {account}".strip()
+    await asyncio.to_thread(_spawn, "napcat", spec, NAPCAT_OUT)
+
+
+@app.post("/api/napcat/start")
+async def api_napcat_start() -> dict:
     env = load_env(ENV_FILE)
-    account = env.get("NAPCAT_ACCOUNT", "")
-    await asyncio.to_thread(
-        _spawn, "napcat", f"app.napcat_runner --account {account}".strip(),
-        NAPCAT_OUT)
+    await _restart_napcat(env.get("NAPCAT_ACCOUNT", ""))
     return {"ok": True}
+
+
+def _napcat_accounts() -> list[str]:
+    """NapCat 历史登录过的号：内外两层 config 目录里的按号配置文件。"""
+    accounts: set[str] = set()
+    for cfg_dir in (ROOT / "napcat" / "napcat" / "config", ROOT / "napcat" / "config"):
+        if not cfg_dir.exists():
+            continue
+        for pattern in ("napcat_*.json", "onebot11_*.json"):
+            for f in cfg_dir.glob(pattern):
+                uin = f.stem.split("_", 1)[1]
+                if uin.isdigit():
+                    accounts.add(uin)
+    return sorted(accounts)
+
+
+@app.get("/api/napcat/accounts")
+async def api_napcat_accounts() -> dict:
+    """可换的号列表：历史登录记录 + 当前配置 + 实际在线（healthz 为准）。"""
+    env = load_env(ENV_FILE)
+    configured = env.get("NAPCAT_ACCOUNT", "").strip()
+    online = ""
+    try:
+        async with httpx.AsyncClient(timeout=0.6) as client:
+            resp = await client.get(f"http://127.0.0.1:{BOT_PORT}/healthz")
+            info = ((resp.json().get("onebot") or {}).get("login_info") or {})
+            online = str(info.get("user_id") or "")
+    except Exception:
+        pass
+    accounts = _napcat_accounts()
+    for a in (configured, online):
+        if a.isdigit() and a not in accounts:
+            accounts.append(a)
+            accounts.sort()
+    return {"ok": True,
+            "accounts": [{"qq": a, "configured": a == configured,
+                          "online": a == online} for a in accounts],
+            "configured": configured, "online": online}
+
+
+@app.post("/api/napcat/switch")
+async def api_napcat_switch(request: Request) -> dict:
+    """换号 / 扫码登录指定号：写配置 → 清孤儿 → 重启协议端（-q 目标号）。
+
+    目标号快登有效则直接连上；失效/没登录过则 NapCat 自动出二维码——
+    二维码是「谁扫谁登录」，不看配置写的号，所以前端必须提示用目标号的手机扫。
+    实测（2026-10-31 日志）：不带 -q 启动时 NapCat 发现本机有快登记录会直接
+    自动登录当前号、二维码不出现——所以扫码登录也必须指定目标号。
+    """
+    body = await _body_json(request)
+    qq = str(body.get("qq") or "").strip()
+    if not qq.isdigit():
+        return {"ok": False, "error": "QQ 号必须是纯数字"}
+    try:
+        update_env({"NAPCAT_ACCOUNT": qq})
+    except EnvValueError as exc:
+        return {"ok": False, "error": str(exc)}
+    await _restart_napcat(qq)
+    # 换号结果探测：快登成功 / 出二维码 / 超时，给用户一句明确的话
+    result = ""
+    for _ in range(15):
+        await asyncio.sleep(1)
+        result = await _napcat_probe(qq)
+        if result:
+            break
+    if result == "online":
+        note = f"✅ 已切换到 {qq} 并直接连上，无需扫码"
+    elif result == "waiting_qr":
+        note = (f"📷 二维码已生成：用 {qq} 的手机到「🚀 运行控制」页扫码"
+                "（约 2 分钟有效，手机上点「授权登录」）")
+    else:
+        note = (f"已切换到 {qq}，15 秒内未检测到登录或出码："
+                " NapCat 可能还在启动，稍后看「🚀 运行控制」页状态或日志")
+    return {"ok": True, "qq": qq, "result": result or "timeout", "note": note}
 
 
 @app.post("/api/napcat/stop")
 async def api_napcat_stop() -> dict:
     await asyncio.to_thread(_stop, "napcat")   # taskkill 阻塞调用入线程池（评审 P2-11）
     return {"ok": True}
+
+
+def _napcat_qr_waiting() -> bool:
+    """runner 在协议端输出里检测到「快登失败→二维码回落」才置真——
+    快登成功路径里 NapCat 顺手刷新出来的码（幽灵码）不算。5 分钟内有效。"""
+    try:
+        data = json.loads(NAPCAT_STATE_FILE.read_text(encoding="utf-8"))
+        return (data.get("phase") == "waiting_qr"
+                and time.time() - float(data.get("ts") or 0) < 300)
+    except (OSError, ValueError):
+        return False
+
+
+async def _napcat_probe(qq: str) -> str:
+    """探测换号结果：online（内核已连上目标号）/ waiting_qr（已出码）/ 空。"""
+    try:
+        async with httpx.AsyncClient(timeout=0.6) as client:
+            resp = await client.get(f"http://127.0.0.1:{BOT_PORT}/healthz")
+            info = ((resp.json().get("onebot") or {}).get("login_info") or {})
+            if str(info.get("user_id") or "") == qq:
+                return "online"
+    except Exception:   # noqa: BLE001
+        pass
+    return "waiting_qr" if _napcat_qr_waiting() else ""
 
 
 @app.get("/api/status")
@@ -1122,7 +1324,9 @@ async def api_status() -> dict:
                     claim_code = code
         except OSError:
             pass
-    mem_dir = ROOT / "data" / "memory"
+    mem_dir = MEM_DIR
+    napcat_up = round(time.time() - _spawn_ts["napcat"], 1) \
+        if _running("napcat") and _spawn_ts["napcat"] else 0
     return {"bot_running": _running("bot") or kernel_up,
             "napcat_running": _running("napcat"),
             "qq_connected": qq_connected,
@@ -1130,7 +1334,9 @@ async def api_status() -> dict:
             "claim_code": claim_code,
             "api_key_set": bool(env.get("DEEPSEEK_API_KEY")),
             "memory_sessions": len(list(mem_dir.glob("*.json"))) if mem_dir.exists() else 0,
-            "bot_port": BOT_PORT}
+            "bot_port": BOT_PORT,
+            "napcat_uptime": napcat_up,
+            "qr_waiting": _napcat_qr_waiting()}
 
 
 @app.get("/api/qrcode")

@@ -32,9 +32,11 @@ PROXY_FILE = ROOT / "data" / "proxy.json"
 DEFAULT_PATH = str(workbuddy_setup.install_dir())
 DEFAULT_PORT = 8788
 
-_state: dict = {"proc": None, "watchdog": None,
+_state: dict = {"proc": None, "watchdog": None, "watchdog_stop": None,
                 "last_error": "", "failures": 0}
 _lock = threading.Lock()
+_cfg_cache: dict = {"at": 0.0, "data": None}
+_CFG_TTL = 2.0
 
 
 # ---------- 配置（data/proxy.json） ----------
@@ -50,20 +52,24 @@ def _resolve_path(preferred: str = "") -> str:
 
 
 def config() -> dict:
+    """读 data/proxy.json（2 秒缓存）。返回副本：调用方改字段不影响缓存。"""
+    now = time.monotonic()
+    if _cfg_cache["data"] is not None and now - _cfg_cache["at"] < _CFG_TTL:
+        return dict(_cfg_cache["data"])
     try:
         data = json.loads(PROXY_FILE.read_text(encoding="utf-8"))
-        if isinstance(data, dict):
-            data["path"] = _resolve_path(str(data.get("path") or ""))
-            data.setdefault("port", DEFAULT_PORT)
-            data.setdefault("api_key", "")
-            data.setdefault("model", "")
-            data.setdefault("active", False)
-            data.setdefault("previous", None)
-            return data
+        if not isinstance(data, dict):
+            data = {}
     except (OSError, ValueError):
-        pass
-    return {"path": _resolve_path(), "port": DEFAULT_PORT, "api_key": "",
-            "model": "", "active": False, "previous": None}
+        data = {}
+    data["path"] = _resolve_path(str(data.get("path") or ""))
+    data.setdefault("port", DEFAULT_PORT)
+    data.setdefault("api_key", "")
+    data.setdefault("model", "")
+    data.setdefault("active", False)
+    data.setdefault("previous", None)
+    _cfg_cache.update(at=now, data=data)
+    return dict(data)
 
 
 def save_config(cfg: dict) -> None:
@@ -71,6 +77,7 @@ def save_config(cfg: dict) -> None:
     tmp = PROXY_FILE.with_suffix(".tmp")
     tmp.write_text(json.dumps(cfg, ensure_ascii=False, indent=2), encoding="utf-8")
     tmp.replace(PROXY_FILE)
+    _cfg_cache.update(at=time.monotonic(), data=cfg)
 
 
 def base_url() -> str:
@@ -126,6 +133,8 @@ async def models(api_key: str) -> list[str]:
 # ---------- 进程 ----------
 
 def _port_listening(port: int) -> bool:
+    """裸端口探测：只在启动失败诊断里用来区分「被占用」和「没起来」。
+    运行判定一律用 is_running() 的 /health 探活（见其注释）。"""
     try:
         result = subprocess.run(["netstat", "-ano"], capture_output=True,
                                 text=True, errors="replace", timeout=5)
@@ -155,8 +164,14 @@ def _running_mine() -> bool:
 
 
 def is_running() -> bool:
-    """端口在监听即视为运行中（含用户手动/看板启动的外部实例）。"""
-    return _port_listening(config()["port"])
+    """/health 探活（评审：netstat 只认端口不认进程——8788 被无关进程占用时
+    会把 Bearer Key 和聊天内容发给它；HTTP 探活顺带解决跨平台与中文系统
+    netstat 解析问题）。用户手动/看板启动的正牌实例同样通过。"""
+    try:
+        resp = httpx.get(f"http://127.0.0.1:{config()['port']}/health", timeout=1.5)
+        return resp.status_code == 200 and isinstance(resp.json(), dict)
+    except Exception:
+        return False
 
 
 def start() -> tuple[bool, str]:
@@ -194,16 +209,29 @@ def start() -> tuple[bool, str]:
             logfile.close()
         deadline = time.time() + 15
         while time.time() < deadline:
-            if _port_listening(cfg["port"]):
+            if is_running():
                 _start_watchdog()
                 return True, f"反代已启动（端口 {cfg['port']}）"
             if _state["proc"].poll() is not None:
+                if _port_listening(cfg["port"]):
+                    return False, (f"端口 {cfg['port']} 已被其他程序占用，"
+                                   "请在反代页换个端口，或结束占用进程")
                 return False, "反代进程启动后立即退出，请看 data/proxy.log"
             time.sleep(0.5)
-        return False, "启动超时（15 秒内端口未监听），请看 data/proxy.log"
+        # 超时：收掉刚拉起的进程，不留孤儿（它稍后自己起来会脱离管理）
+        proc = _state["proc"]
+        if proc and proc.poll() is None:
+            proc.terminate()
+        _state["proc"] = None
+        return False, "启动超时（15 秒内未就绪），已终止本次进程，请看 data/proxy.log"
 
 
 def stop() -> tuple[bool, str]:
+    evt = _state.get("watchdog_stop")
+    if evt:
+        evt.set()   # 先叫停守护线程：别让它把刚停的进程又拉起来
+        _state["watchdog_stop"] = None
+    _state["watchdog"] = None
     proc = _state["proc"]
     if proc and proc.poll() is None:
         proc.terminate()
@@ -225,14 +253,16 @@ def stop() -> tuple[bool, str]:
 def _start_watchdog() -> None:
     if _state["watchdog"] and _state["watchdog"].is_alive():
         return
+    stop_evt = threading.Event()
 
     def _watch():
-        while config().get("active"):
-            time.sleep(60)
-            if not config().get("active"):
+        while not stop_evt.is_set():
+            stop_evt.wait(60)
+            if stop_evt.is_set() or not config().get("active"):
                 break
             if is_running():
                 _state["failures"] = 0
+                _state["last_error"] = ""   # 恢复后清掉旧告警，面板不再常红
                 continue
             _state["failures"] += 1
             logger.warning("反代探活失败({}/3)，尝试自动拉起", _state["failures"])
@@ -242,6 +272,7 @@ def _start_watchdog() -> None:
                     _state["last_error"] = f"反代连续拉起失败: {msg[:120]}"
                     logger.warning("{}", _state["last_error"])
 
+    _state["watchdog_stop"] = stop_evt
     _state["watchdog"] = threading.Thread(target=_watch, daemon=True)
     _state["watchdog"].start()
 

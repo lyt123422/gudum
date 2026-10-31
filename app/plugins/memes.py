@@ -7,9 +7,11 @@
 """
 from __future__ import annotations
 
+import random
 import re
 import time
 from pathlib import Path
+from urllib.parse import urljoin
 
 import httpx
 from nonebot import logger, on_command
@@ -21,6 +23,7 @@ from ..envutil import ROOT
 from .chat import _cmd_gate
 
 MEME_DIR = ROOT / "data" / "memes"
+_MAX_BYTES = 10 * 1024 * 1024
 
 cmd_save = on_command("存表情", rule=_cmd_gate, priority=4, block=True)
 cmd_meme = on_command("表情包", aliases={"斗图", "来个表情"},
@@ -42,9 +45,36 @@ def _safe_name(name: str) -> str:
 
 
 def _meme_files() -> list[Path]:
-    MEME_DIR.mkdir(parents=True, exist_ok=True)
+    if not MEME_DIR.exists():   # 纯读路径不带 mkdir 副作用
+        return []
     return sorted(f for f in MEME_DIR.iterdir()
                   if f.suffix.lower() in (".jpg", ".png", ".gif", ".webp"))
+
+
+async def _download_image(url: str) -> bytes:
+    """下载 QQ 聊天图：逐跳复查域名白名单（防 302 带偏到任意域，评审 P2-18）、
+    流式读取超限即断。范式与 vision.fetch_data_url 一致。"""
+    current = url
+    async with httpx.AsyncClient(timeout=15, follow_redirects=False,
+                                 headers={"User-Agent": "Mozilla/5.0"}) as client:
+        for _ in range(3):
+            if not vision.host_allowed(current):
+                raise ValueError("图片域名不在 QQ 多媒体白名单")
+            async with client.stream("GET", current) as resp:
+                if resp.status_code in (301, 302, 303, 307, 308):
+                    location = resp.headers.get("location", "")
+                    if not location:
+                        raise ValueError("图片重定向失败")
+                    current = urljoin(current, location)
+                    continue
+                resp.raise_for_status()
+                buf = bytearray()
+                async for chunk in resp.aiter_bytes():
+                    buf.extend(chunk)
+                    if len(buf) > _MAX_BYTES:
+                        raise ValueError("图片超过 10MB")
+                return bytes(buf)
+    raise ValueError("图片重定向次数过多")
 
 
 async def _image_url_from_reply(bot: Bot, event: MessageEvent) -> str | None:
@@ -82,10 +112,9 @@ async def _(matcher, bot: Bot, event: MessageEvent, args: Message = CommandArg()
         await matcher.finish("只收录 QQ 聊天里的图片")
     name = _safe_name(args.extract_plain_text() or f"meme_{int(time.time())}")
     try:
-        async with httpx.AsyncClient(timeout=15, follow_redirects=True) as client:
-            resp = await client.get(url)
-            resp.raise_for_status()
-        data = resp.content
+        data = await _download_image(url)
+    except ValueError as exc:
+        await matcher.finish(f"没收：{exc}")
     except Exception as exc:
         logger.warning("表情包下载失败: {}", exc)
         await matcher.finish("表情下载失败，稍后再试")
@@ -105,13 +134,13 @@ async def _(matcher, bot: Bot, event: MessageEvent, args: Message = CommandArg()
 @cmd_meme.handle()
 async def _(matcher, args: Message = CommandArg()):  # noqa: B008
     await _meme_enabled(matcher)
-    keyword = _safe_name(args.extract_plain_text())
+    keyword = (args.extract_plain_text() or "").strip()   # 不过 _safe_name：别把「好耶！」洗成匹配不到的「好耶_」
     files = _meme_files()
     if keyword:
         files = [f for f in files if keyword in f.stem] or files
     if not files:
         await matcher.finish("表情包库还是空的：回复一张图发「存表情 名字」来收录")
-    pick = files[int(time.time()) % len(files)]   # 伪随机就够了
+    pick = random.choice(files)
     await matcher.finish(MessageSegment.image(f"file:///{pick.resolve().as_posix()}"))
 
 

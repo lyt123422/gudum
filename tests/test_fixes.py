@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import asyncio
 import io
+import json
 import os
 import tempfile
 import threading
@@ -101,18 +102,23 @@ class TestSaveChangedDetection(unittest.TestCase):
                           (Path(tmp) / ".env").read_text(encoding="utf-8"))
 
     def test_evil_base_without_key_rejected(self):
-        """评审 v3 P0-1：换 base_url 不带 Key = 旧 Key 外带，必须拒绝。"""
+        """评审 v3 P0-1 + 审计 F3：换 base 不带 Key——本地地址放行但必须清掉
+        旧 Key（绝不外带），非本地地址仍然拒绝。"""
         with tempfile.TemporaryDirectory() as tmp:
             client, started, env = self._client(Path(tmp))
             r = client.post("/api/save", json={
                 "base_url": "http://127.0.0.1:9999/v1",
                 "model": "deepseek-chat"}).json()
-            self.assertFalse(r["ok"])
-            self.assertIn("API Key", r["error"])
+            self.assertTrue(r["ok"])   # 本地地址：允许（Ollama 可能在任意端口）
             text = env.read_text(encoding="utf-8")
-            self.assertIn("sk-test-old", text)
-            self.assertNotIn("9999", text)
-            self.assertEqual(started["n"], 0)
+            self.assertNotIn("sk-test-old", text)   # 旧 Key 绝不发往新地址
+            self.assertIn("http://127.0.0.1:9999/v1", text)
+            r2 = client.post("/api/save", json={
+                "base_url": "https://evil.example.com/v1",
+                "model": "deepseek-chat"}).json()
+            self.assertFalse(r2["ok"])
+            self.assertIn("API Key", r2["error"])
+            self.assertEqual(started["n"], 1)   # 第一次保存真改了配置：重启是预期行为
 
     def test_evil_base_with_new_key_allowed(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -228,10 +234,67 @@ class TestDouyinRealDevice(unittest.TestCase):
         from app import douyin
         douyin._state["device"] = None
         with mock.patch.object(douyin, "connect",
-                               lambda: (False, "测试环境：不连手机")):
+                               lambda: (False, "测试环境：不连手机")), \
+                mock.patch.object(douyin, "_vision_model_ok", lambda m: True):
             ok, msg = douyin.start(1)
         self.assertFalse(ok)
         self.assertIn("测试环境", msg)
+
+    def test_start_blocks_text_only_model(self):
+        """deepseek 官方 API 全系文本模型：抖音决策开刷前就拦住，不再白烧 3 次 API。"""
+        from app import douyin
+        self.assertFalse(douyin._vision_model_ok("deepseek-chat"))
+        self.assertFalse(douyin._vision_model_ok("deepseek-reasoner"))
+        self.assertFalse(douyin._vision_model_ok("deepseek-ai/DeepSeek-V3"))
+        self.assertTrue(douyin._vision_model_ok("deepseek-vl2"))
+        self.assertTrue(douyin._vision_model_ok("gemini-2.5-flash"))
+        self.assertTrue(douyin._vision_model_ok("gpt-4o"))
+
+    def test_ensure_awake_retries(self):
+        """评审：旧版 for 循环两个分支都必然 return，"重试两次"从未发生。"""
+        from app import douyin
+
+        class SleepyDev:
+            def __init__(self):
+                self.calls = 0
+
+            def screen_on(self):
+                self.calls += 1
+                if self.calls == 1:
+                    raise RuntimeError("first try fails")
+
+            def unlock(self):
+                pass
+
+        class DeadDev:
+            def screen_on(self):
+                raise RuntimeError("no screen")
+
+            def unlock(self):
+                pass
+
+        with mock.patch("time.sleep", lambda s: None):
+            dev = SleepyDev()
+            self.assertTrue(douyin._ensure_awake(dev))
+            self.assertEqual(dev.calls, 2)
+            self.assertFalse(douyin._ensure_awake(DeadDev()))
+
+    def test_pause_freezes_active_time(self):
+        """暂停时间不消耗会话预算，也不计入今日账单。"""
+        from app import douyin
+        dummy = threading.Thread(target=lambda: time.sleep(3), daemon=True)
+        dummy.start()
+        douyin._state["thread"] = dummy
+        try:
+            ok, _ = douyin.pause()
+            self.assertTrue(ok)
+            time.sleep(0.05)
+            ok, _ = douyin.resume()
+            self.assertTrue(ok)
+        finally:
+            douyin._state["pause"].clear()
+        self.assertGreaterEqual(douyin._state["paused_total"], 0.04)
+        self.assertEqual(douyin._state["paused_at"], 0.0)
 
     def test_execute_decision_swipes_once(self):
         from app import douyin
@@ -503,10 +566,6 @@ class TestRestartPidGuard(unittest.TestCase):
 
     def test_new_pid_means_success(self):
         self.assertTrue(self._run(health_pid=222))
-
-
-if __name__ == "__main__":
-    unittest.main()
 
 
 class TestAssistantState(unittest.TestCase):
@@ -896,6 +955,28 @@ class TestScheduleCrud(_ScheduleIsolated, unittest.TestCase):
         self.sched.add_task("提醒", "30 8 * * *", "起床", "10001", "private")
         self.assertEqual(self.sched._load()[0]["type"], "private")
 
+    def test_remove_cleans_runtime(self):
+        """删除任务要清掉运行结果残留（clear_runtime 由此复活）。"""
+        self.sched.add_task("早报", "0 9 * * *", "早", "777")
+        self.core.stamp_runtime("早报", 123, True)
+        self.assertIn("早报", self.core.load_runtime())
+        self.assertTrue(self.sched.remove_task("早报")[0])
+        self.assertNotIn("早报", self.core.load_runtime())
+
+    def test_add_same_name_hint(self):
+        """QQ 侧同名添加不再静默覆盖，给出明确提示。"""
+        self.sched.add_task("早报", "0 9 * * *", "第一版", "1")
+        event = type("E", (), {"message_type": "group"})()
+        msg = self.sched._cmd_add("早报 | 0 10 * * * | 第二版 | 2", event)
+        self.assertIn("同名", msg)
+        self.assertEqual(self.sched._load()[0]["content"], "第一版")
+
+    def test_minute_mark_single_source(self):
+        """minute_mark 收敛到 core 单一实现，插件与 core 算法一致。"""
+        when = time.mktime(time.struct_time((2026, 10, 26, 9, 0, 0, 0, 1, 0)))
+        self.assertEqual(self.core.minute_mark(when),
+                         int(time.mktime(time.localtime(when))) // 60)
+
 
 class TestScheduleDispatch(_ScheduleIsolated, unittest.TestCase):
     """到期判定与发送（Bot 全 mock，绝不真连 QQ）。"""
@@ -1256,3 +1337,277 @@ class TestChatTools(unittest.TestCase):
                 tools=[{"type": "function", "function": {"name": "web_search"}}],
                 tool_executor=lambda n, a: "x"))
         self.assertTrue(getattr(ctx.exception, "fallback", False))
+
+
+class TestModelConfigJourney(unittest.TestCase):
+    """配置审计回归（2026-10-31）：模拟用户填 Key 全流程，临时 .env/档案。
+
+    复现并锁住四个真问题：档案归属污染、反代激活期直连改动丢失、
+    Ollama 本地被拒、换号 API。
+    """
+
+    def _client(self, tmp: Path):
+        from fastapi.testclient import TestClient
+        from app import panel
+        import app.proxy_manager as pm
+        env = tmp / ".env"
+        env.write_text('SUPERUSERS=["10000"]\n', encoding="utf-8")
+        patches = [
+            mock.patch.object(panel, "ENV_FILE", env),
+            mock.patch.object(panel, "PROVIDERS_FILE", tmp / "providers.json"),
+            mock.patch.object(panel, "_pid_on_port", lambda port: None),
+            mock.patch.object(panel, "_running", lambda name: False),
+            mock.patch.object(panel, "_restart_kernel_if_running",
+                              mock.AsyncMock(return_value=False)),
+            mock.patch.object(pm, "PROXY_FILE", tmp / "proxy.json"),
+        ]
+        for p in patches:
+            p.start()
+        self.addCleanup(lambda: [p.stop() for p in patches])
+        return TestClient(panel.app, base_url="http://127.0.0.1:8090"), env
+
+    def test_provider_home_follows_base_url(self):
+        """审计 F1：高亮 DeepSeek 却填 GLM 地址 → 档案归属按地址纠正。"""
+        with tempfile.TemporaryDirectory() as td:
+            from app import panel
+            client, _ = self._client(Path(td))
+            r = client.post("/api/save", json={
+                "provider": "DeepSeek",
+                "base_url": "https://open.bigmodel.cn/api/paas/v4",
+                "api_key": "glm-key-1", "model": "glm-4.7-flash"}).json()
+            self.assertTrue(r["ok"], r)
+            profiles = panel._load_profiles()
+            self.assertNotIn("glm-key-1", json.dumps(profiles.get("DeepSeek", {})))
+            self.assertEqual(profiles["智谱GLM"]["api_key"], "glm-key-1")
+
+    def test_local_base_allows_empty_key(self):
+        """审计 F3：切 Ollama 本地无 Key 不再被拒；.env 旧 Key 被清掉（不外带），
+        但 DeepSeek 档案里仍留着，切回来就能恢复。"""
+        with tempfile.TemporaryDirectory() as td:
+            from app import panel
+            client, env = self._client(Path(td))
+            r1 = client.post("/api/save", json={
+                "provider": "DeepSeek", "base_url": "https://api.deepseek.com",
+                "api_key": "sk-first-key", "model": "deepseek-chat"}).json()
+            self.assertTrue(r1["ok"], r1)
+            r2 = client.post("/api/save", json={
+                "provider": "Ollama本地", "base_url": "http://localhost:11434/v1",
+                "model": "qwen3:8b"}).json()
+            self.assertTrue(r2["ok"], r2)
+            text = env.read_text(encoding="utf-8")
+            self.assertIn("http://localhost:11434/v1", text)
+            self.assertNotIn("sk-first-key", text)   # 旧 Key 不发往新地址：清空
+            profiles = panel._load_profiles()
+            self.assertEqual(profiles["DeepSeek"]["api_key"], "sk-first-key")
+            # 切回 DeepSeek（不填 Key）→ 档案恢复
+            r3 = client.post("/api/save", json={
+                "provider": "DeepSeek", "base_url": "https://api.deepseek.com",
+                "model": "deepseek-chat"}).json()
+            self.assertTrue(r3["ok"], r3)
+            self.assertIn("sk-first-key", env.read_text(encoding="utf-8"))
+
+    def test_proxy_active_direct_change_survives_stop(self):
+        """审计 F2：反代激活时改直连 Key → 存档案+刷新切回快照 → 停止后是新的。"""
+        with tempfile.TemporaryDirectory() as td:
+            import app.proxy_manager as pm
+            client, env = self._client(Path(td))
+            r1 = client.post("/api/save", json={
+                "provider": "DeepSeek", "base_url": "https://api.deepseek.com",
+                "api_key": "sk-old-direct", "model": "deepseek-chat"}).json()
+            self.assertTrue(r1["ok"], r1)
+            pm.PROXY_FILE.write_text(json.dumps({
+                "path": "", "port": 8788, "api_key": "hub-key",
+                "model": "deepseek-v4.1-flash", "active": True,
+                "previous": {"base_url": "https://api.deepseek.com",
+                             "api_key": "sk-old-direct",
+                             "model": "deepseek-chat"}}), encoding="utf-8")
+            pm._cfg_cache.update(at=0.0, data=None)   # 模拟 2 秒后用户才操作
+            r2 = client.post("/api/save", json={
+                "base_url": "https://api.deepseek.com",
+                "api_key": "sk-NEW-direct", "model": "deepseek-chat"}).json()
+            self.assertTrue(r2["ok"], r2)
+            r3 = client.post("/api/proxy/stop", json={}).json()
+            self.assertTrue(r3["ok"], r3)
+            text = env.read_text(encoding="utf-8")
+            self.assertIn("DEEPSEEK_API_KEY=sk-NEW-direct", text)
+            self.assertNotIn("sk-old-direct", text)
+
+    def test_napcat_switch_endpoint(self):
+        """换号 API：写 NAPCAT_ACCOUNT 并重启协议端；非法输入拒绝。"""
+        with tempfile.TemporaryDirectory() as td:
+            from app import panel
+            client, env = self._client(Path(td))
+            with mock.patch.object(panel, "_restart_napcat",
+                                   mock.AsyncMock(return_value=None)) as rn:
+                r = client.post("/api/napcat/switch",
+                                json={"qq": "100011001"}).json()
+            self.assertTrue(r["ok"], r)
+            rn.assert_awaited_once_with("100011001")
+            self.assertIn("NAPCAT_ACCOUNT=100011001",
+                          env.read_text(encoding="utf-8"))
+            bad = client.post("/api/napcat/switch", json={"qq": "abc"}).json()
+            self.assertFalse(bad["ok"])
+
+
+class TestNapcatLoginState(unittest.TestCase):
+    """协议端输出 → 登录阶段检测（关键词全部取自实测日志样本）。"""
+
+    class _FakeAliveProc:
+        """poll()=None 的假进程：让 _running('napcat') 为真。"""
+
+        def poll(self):
+            return None
+
+    def test_classify_lines(self):
+        from app.napcat_runner import _classify
+        self.assertEqual(_classify(
+            "10-31 11:58:11 [info] [NapCat] [Fork] Worker进程已登录成功，"
+            "切换到正常重试策略"), "logged_in")
+        self.assertEqual(_classify(
+            "10-31 11:58:11 [info] [NapCat] 已通知主进程登录成功"), "logged_in")
+        self.assertEqual(_classify(
+            "10-25 15:14:57 [error] 快速登录错误： 登录态已失效，请重新登录。"),
+            "waiting_qr")
+        self.assertEqual(_classify(
+            "QQ 100011001 未配置回退密码环境变量，建议优先使用 ACCOUNT + "
+            "NAPCAT_QUICK_PASSWORD，将使用二维码登录方式"), "waiting_qr")
+        self.assertEqual(_classify("正在快速登录  3974914575"), "")
+
+    def test_status_uptime_and_qr_waiting(self):
+        """/api/status 暴露 napcat_uptime 与 qr_waiting（幽灵码过滤的数据源）。"""
+        with tempfile.TemporaryDirectory() as td:
+            from fastapi.testclient import TestClient
+            from app import panel
+            state = Path(td) / "napcat_login_state.json"
+            state.write_text(json.dumps(
+                {"phase": "waiting_qr", "account": "100011001",
+                 "ts": time.time()}), encoding="utf-8")
+            patches = [
+                mock.patch.object(panel, "NAPCAT_STATE_FILE", state),
+                mock.patch.object(panel, "_spawn_ts",
+                                  {"bot": 0.0, "napcat": time.time() - 2}),
+                mock.patch.object(panel, "_procs",
+                                  {"bot": None, "napcat": self._FakeAliveProc()}),
+            ]
+            for p in patches:
+                p.start()
+            self.addCleanup(lambda: [p.stop() for p in patches])
+            client = TestClient(panel.app, base_url="http://127.0.0.1:8090")
+            s = client.get("/api/status").json()
+            self.assertTrue(s["qr_waiting"])
+            self.assertGreater(s["napcat_uptime"], 1)
+
+
+class TestPersonaSwitchClearsMemory(unittest.TestCase):
+    """换人设自动清空记忆：内核侧 memory_clear_all + 面板侧切换/删除回落。"""
+
+    def test_memory_clear_all(self):
+        from app.plugins import chat as chat_mod
+        with tempfile.TemporaryDirectory() as td:
+            mem = Path(td) / "memory"
+            mem.mkdir()
+            (mem / "p1.json").write_text('{"ts":1,"msgs":[]}', encoding="utf-8")
+            (mem / "p2.json").write_text('{"ts":2,"msgs":[]}', encoding="utf-8")
+            (mem / "keep.txt").write_text("x", encoding="utf-8")
+            chat_mod._SESSION_GEN["g1_u2"] = 5
+            self.addCleanup(chat_mod._SESSION_GEN.clear)
+            with mock.patch.object(chat_mod, "_MEMORY_DIR", mem):
+                cleared = chat_mod.memory_clear_all()
+            self.assertEqual(cleared, 2)
+            self.assertEqual(list(mem.glob("*.json")), [])
+            self.assertTrue((mem / "keep.txt").exists())   # 只清 json，不误伤别的
+            self.assertEqual(chat_mod._SESSION_GEN["g1_u2"], 6)   # 旧请求作废
+
+    def test_panel_persona_switch_clears_memory(self):
+        with tempfile.TemporaryDirectory() as td:
+            from fastapi.testclient import TestClient
+            from app import panel
+            mem = Path(td) / "memory"
+            mem.mkdir()
+            (mem / "p1.json").write_text("{}", encoding="utf-8")
+            patches = [
+                mock.patch.object(panel, "MEM_DIR", mem),
+                mock.patch.object(panel.personas, "load_all",
+                                  lambda: {"甲": object(), "乙": object()}),
+                mock.patch.object(panel.personas, "set_active", lambda n: None),
+            ]
+            for p in patches:
+                p.start()
+            self.addCleanup(lambda: [p.stop() for p in patches])
+            client = TestClient(panel.app, base_url="http://127.0.0.1:8090")
+            r = client.post("/api/persona/switch", json={"name": "乙"}).json()
+            self.assertTrue(r["ok"], r)
+            self.assertEqual(r["memory_cleared"], 1)
+            self.assertEqual(list(mem.glob("*.json")), [])
+
+
+class TestTtsProviderRouting(unittest.TestCase):
+    """tts.synth 路由：默认走 edge；gptsovits 模式走克隆、失败降级 edge。"""
+
+    def setUp(self):
+        from app import tts
+        self.tts = tts
+        self.calls = {"gsv": 0, "edge": 0}
+
+    def test_default_uses_edge(self):
+        async def run():
+            async def fake_gsv(t):
+                self.calls["gsv"] += 1
+                raise RuntimeError("should not be called")
+            async def fake_edge(t, v):
+                self.calls["edge"] += 1
+                return Path("x.mp3")
+            with mock.patch.dict("os.environ", {}, clear=False), \
+                    mock.patch.object(self.tts, "_synth_gptsovits", fake_gsv), \
+                    mock.patch.object(self.tts, "_synth_edge", fake_edge), \
+                    mock.patch.object(self.tts, "load_env", lambda p: {}):
+                return await self.tts.synth("你好")
+        self.assertEqual(asyncio.run(run()), Path("x.mp3"))
+        self.assertEqual(self.calls, {"gsv": 0, "edge": 1})
+
+    def test_gptsovits_mode_and_fallback(self):
+        async def run(provider_env):
+            async def fake_gsv(t):
+                self.calls["gsv"] += 1
+                if self.calls["gsv"] == 1:
+                    return Path("clone.wav")
+                raise RuntimeError("服务挂了")
+            async def fake_edge(t, v):
+                self.calls["edge"] += 1
+                return Path("edge.mp3")
+            with mock.patch.object(self.tts, "_synth_gptsovits", fake_gsv), \
+                    mock.patch.object(self.tts, "_synth_edge", fake_edge), \
+                    mock.patch.object(self.tts, "load_env",
+                                      lambda p: provider_env):
+                return await self.tts.synth("你好")
+        # 克隆可用：走 gsv
+        self.assertEqual(asyncio.run(run({"TTS_PROVIDER": "gptsovits"})),
+                         Path("clone.wav"))
+        # 克隆挂了：降级 edge，不哑
+        self.assertEqual(asyncio.run(run({"TTS_PROVIDER": "gptsovits"})),
+                         Path("edge.mp3"))
+        self.assertEqual(self.calls, {"gsv": 2, "edge": 1})
+
+
+class TestLogRotation(unittest.TestCase):
+    """面板托管日志的轮转：超 5MB 留一代 .old，防无限膨胀。"""
+
+    def test_rotate_oversized_log(self):
+        from app import panel
+        with tempfile.TemporaryDirectory() as td:
+            log = Path(td) / "panel_bot.log"
+            log.write_text("x" * (5 * 1024 * 1024 + 100), encoding="utf-8")
+            panel._rotate_log(log)
+            self.assertFalse(log.exists())
+            old = log.with_suffix(".log.old")
+            self.assertTrue(old.exists())
+            self.assertGreater(old.stat().st_size, 5 * 1024 * 1024)
+            # 未超限的日志不动
+            small = Path(td) / "small.log"
+            small.write_text("tiny", encoding="utf-8")
+            panel._rotate_log(small)
+            self.assertTrue(small.exists())
+
+
+if __name__ == "__main__":
+    unittest.main()

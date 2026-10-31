@@ -2,24 +2,51 @@
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import shutil
 import subprocess
 import sys
+import time
 from pathlib import Path
 from typing import TextIO
 
 from .log_setup import write_redacted
 
 ROOT = Path(__file__).resolve().parents[1]
+STATE_FILE = ROOT / "data" / "napcat_login_state.json"
 
 
-def relay_output(source: TextIO, destination: TextIO, log_file: TextIO | None = None) -> None:
+def _classify(line: str) -> str:
+    """NapCat 输出行 → 登录阶段（关键词取自实测日志，见 tests）。"""
+    if "已通知主进程登录成功" in line or "Worker进程已登录成功" in line:
+        return "logged_in"
+    if "将使用二维码登录方式" in line or "快速登录错误" in line:
+        return "waiting_qr"
+    return ""
+
+
+def _write_state(phase: str, account: str) -> None:
+    """登录阶段落盘，面板据此区分"等你扫码"和"幽灵码"（快登刷新副产物）。"""
+    try:
+        data = {"phase": phase, "account": account, "ts": time.time()}
+        tmp = STATE_FILE.with_suffix(".tmp")
+        tmp.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+        tmp.replace(STATE_FILE)
+    except OSError:
+        pass
+
+
+def relay_output(source: TextIO, destination: TextIO, log_file: TextIO | None = None,
+                 account: str = "") -> None:
     """只复制经过脱敏的文本；UTF-8 损坏由启动时的 errors=replace 兜底。"""
     for line in source:
         write_redacted(destination, line)
         if log_file is not None:
             write_redacted(log_file, line)
+        phase = _classify(line)
+        if phase:
+            _write_state(phase, account)
 
 
 def node_command(napcat_dir: Path) -> list[str]:
@@ -41,6 +68,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--log-file", type=Path)
     args = parser.parse_args(argv)
     napcat_dir = ROOT / "napcat"
+    # 必须带 -q 指定目标号：实测不带 -q 时 NapCat 发现本机有快登记录会
+    # 直接自动登录当前号，二维码不出现（2026-10-31 11:47 日志）
     command = node_command(napcat_dir) + ["-q", args.account]
     # NapCat 官方支持 NAPCAT_QUICK_PASSWORD 环境变量做密码快速登录
     # （配置在 .env 的 NAPCAT_QUICK_PASSWORD / ACCOUNT），免扫码
@@ -51,6 +80,7 @@ def main(argv: list[str] | None = None) -> int:
         if value:
             child_env[key] = value
     output = args.log_file.open("a", encoding="utf-8") if args.log_file else None
+    _write_state("starting", args.account)
     try:
         # 不使用 shell，账号不会被解释为命令；返回协议端退出码。
         with subprocess.Popen(command, cwd=napcat_dir, stdout=subprocess.PIPE,
@@ -59,7 +89,8 @@ def main(argv: list[str] | None = None) -> int:
                               creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0)) as process:
             assert process.stdout is not None
             try:
-                relay_output(process.stdout, sys.stdout, output)
+                relay_output(process.stdout, sys.stdout, output,
+                             account=args.account)
             finally:
                 process.stdout.close()
             return process.wait()

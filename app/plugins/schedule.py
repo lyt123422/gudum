@@ -84,13 +84,13 @@ def plugin_status() -> dict:
 
 # ---------- 发送与调度 ----------
 
-async def _send(task: dict) -> bool:
-    """按任务目标发消息；失败/超时返回 False，不打死调度器。"""
+async def _send(task: dict) -> tuple[bool, str]:
+    """按任务目标发消息；返回 (成败, 失败原因)——原因透传给 runtime 供面板排查。"""
     try:
         bot = get_bot()
     except Exception:
         logger.warning("定时任务「{}」：机器人未连接，跳过", task["name"])
-        return False
+        return False, "机器人未连接"
     target = str(task["target"])
     try:
         if task["type"] == "private":
@@ -102,13 +102,13 @@ async def _send(task: dict) -> bool:
                                       message=task["content"],
                                       auto_escape=True)
         await asyncio.wait_for(coro, timeout=15)
-    except TimeoutError:
+    except (TimeoutError, asyncio.TimeoutError):   # noqa: UP041 py3.10 两者不同类，都要接
         logger.warning("定时任务「{}」发送超时（15s）", task["name"])
-        return False
+        return False, "发送超时（15 秒）"
     except Exception as exc:
         logger.warning("定时任务「{}」发送失败：{}", task["name"], exc)
-        return False
-    return True
+        return False, f"发送失败: {str(exc)[:80]}"
+    return True, ""
 
 
 async def _tick_once(now: float | None = None) -> int:
@@ -118,12 +118,11 @@ async def _tick_once(now: float | None = None) -> int:
     if not plugin_manager.is_enabled("schedule"):
         return 0
     when = time.time() if now is None else now
-    minute_mark = int(time.mktime(time.localtime(when))) // 60
+    mark = core.minute_mark(when)
     sent = 0
     for task in core.due_tasks(when):
-        ok = await _send(task)
-        core.stamp_runtime(task["name"], minute_mark, ok,
-                           "" if ok else "发送失败")
+        ok, reason = await _send(task)
+        core.stamp_runtime(task["name"], mark, ok, reason)
         sent += 1 if ok else 0
     return sent
 
@@ -205,13 +204,18 @@ def _cmd_add(rest: str, event: MessageEvent) -> str:
         return ("用法：定时任务 添加 <名字> | <cron> | <内容> | <群号>\n"
                 "例：定时任务 添加 早报 | 0 9 * * 1-5 | 大家早！ | 123456\n"
                 "发给好友用：定时任务 添加 提醒 | 30 8 * * * | 该起床了 | friend:10001")
-    name, cron, content = parts[0], parts[1], parts[2]
+    name_raw, cron, content = parts[0], parts[1], parts[2]
     target_raw = parts[3]
     if target_raw.lower().startswith("friend:"):
         task_type, target = "private", target_raw.split(":", 1)[1].strip()
     else:
         task_type = "private" if event.message_type == "private" else "group"
         target = target_raw
+    name = core.clean_name(name_raw)
+    if any(t["name"] == name for t in core.load_tasks()):
+        # QQ 侧同名覆盖对用户是坑（面板保存才是显式 upsert）：先提醒，不静默替换
+        return (f"❌ 已有同名任务「{name}」：要改内容去面板保存，"
+                f"或先发「定时任务 删除 {name}」再添加")
     ok, msg = core.add_task(name, cron, content, target, task_type)
     return ("✅ " if ok else "❌ ") + msg
 
@@ -222,6 +226,5 @@ async def _cmd_run(name: str) -> str:
     task = next((t for t in core.load_tasks() if t["name"] == name), None)
     if task is None:
         return f"没有叫「{name}」的任务"
-    ok = await _send(task)
-    return f"「{name}」已发出" if ok else (
-        f"「{name}」发送失败（机器人没连上，或号码不对/被风控）")
+    ok, reason = await _send(task)
+    return f"「{name}」已发出" if ok else f"「{name}」发送失败（{reason}）"

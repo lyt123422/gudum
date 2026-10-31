@@ -1,0 +1,5 @@
+# 开发/测试工具（运行不需要）。
+# 安装：.venv\Scripts\python.exe -m pip install -r dev-requirements.txt
+pytest>=8
+Pillow>=10
+ruff>=0.6

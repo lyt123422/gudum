@@ -260,6 +260,24 @@ def memory_clear(key: str) -> None:
     _mem_path(key).unlink(missing_ok=True)
 
 
+def memory_clear_all() -> int:
+    """清空全部会话记忆（换人设用）：人格换了，旧人格的语气不该继续影响模型。
+
+    同时递增所有会话的代数，让进行中的旧请求回复作废。返回清掉的会话数。
+    """
+    count = 0
+    if _MEMORY_DIR.exists():
+        for f in _MEMORY_DIR.glob("*.json"):
+            try:
+                f.unlink()
+                count += 1
+            except OSError:
+                pass
+    for key in list(_SESSION_GEN):
+        _SESSION_GEN[key] = _SESSION_GEN.get(key, 0) + 1
+    return count
+
+
 def memory_count() -> int:
     return len(list(_MEMORY_DIR.glob("*.json"))) if _MEMORY_DIR.exists() else 0
 
@@ -685,7 +703,7 @@ async def _do_chat(matcher, event: MessageEvent, q: str,
         voice_name = active.voice or TTS_VOICE
     if want_voice:
         try:
-            mp3 = await asyncio.wait_for(tts.synth(reply, voice_name), timeout=15)
+            mp3 = await asyncio.wait_for(tts.synth(reply, voice_name), timeout=30)
             await matcher.send(MessageSegment.record(
                 f"file:///{mp3.resolve().as_posix()}"))
         except ActionFailed as exc:
@@ -872,8 +890,11 @@ async def _(matcher, event: MessageEvent, args: Message = CommandArg()):  # noqa
     if name not in library:
         await matcher.finish("没有这个人设，可用：" + "、".join(sorted(library)))
     personas.set_active(name)
+    cleared = memory_clear_all()   # 换人格=换说话方式：旧人设的记忆一并带走
     greeting = library[name].greeting
-    await matcher.finish(f"✅ 已切换为「{name}」" + (f"，开场白：{greeting}" if greeting else ""))
+    await matcher.finish(
+        f"✅ 已切换为「{name}」" + (f"，开场白：{greeting}" if greeting else "")
+        + f"\n🧹 已按新人格清空全部会话记忆（{cleared} 个会话）")
 
 
 @cmd_persona.handle()

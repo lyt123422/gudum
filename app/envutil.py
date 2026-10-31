@@ -20,7 +20,8 @@ class EnvValueError(ValueError):
 def load_env(path: Path) -> dict[str, str]:
     result: dict[str, str] = {}
     try:
-        lines = Path(path).read_text(encoding="utf-8").splitlines()
+        # utf-8-sig：带 BOM 的 .env（记事本另存常见）首键不再粘上 \ufeff
+        lines = Path(path).read_text(encoding="utf-8-sig").splitlines()
     except OSError:
         return result
     for line in lines:
