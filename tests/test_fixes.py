@@ -1686,5 +1686,134 @@ class TestModelHotReload(unittest.TestCase):
             self.assertIn("sk-new", env.read_text(encoding="utf-8"))
 
 
+class TestModelProfilesTool(unittest.TestCase):
+    """model_profiles 工具：匹配/掩码/校验/反代状态（纯标准库，无 nonebot）。"""
+
+    def setUp(self):
+        from app import model_profiles as mp
+        self.mp = mp
+
+    def test_match_name(self):
+        profiles = {"gemini": {}, "qwen": {}, "自定义": {}}
+        self.assertEqual(self.mp.match_name(profiles, "gemini"), "gemini")
+        self.assertEqual(self.mp.match_name(profiles, "gem"), "gemini")
+        self.assertEqual(self.mp.match_name(profiles, "q"), "qwen")   # 唯一前缀命中
+        self.assertIsNone(self.mp.match_name({"qwen": {}, "qwen2": {}}, "qwe"))  # 歧义
+        self.assertIsNone(self.mp.match_name(profiles, "不存在的"))
+        self.assertIsNone(self.mp.match_name({}, "x"))
+
+    def test_validate(self):
+        ok = {"base_url": "https://a.com/v1", "api_key": "sk-x", "model": "m"}
+        self.assertIsNone(self.mp.validate(ok))   # 不抛即通过
+        local = {"base_url": "http://127.0.0.1:11434/v1", "api_key": "", "model": "m"}
+        self.assertIsNone(self.mp.validate(local))   # 本地免 Key
+        for bad in ({"base_url": "ftp://x", "api_key": "k", "model": "m"},
+                    {"base_url": "https://a.com/v1", "api_key": "", "model": "m"},
+                    {"base_url": "https://a.com/v1", "api_key": "https://polluted",
+                     "model": "m"},
+                    {"base_url": "https://a.com/v1", "api_key": "k", "model": ""}):
+            with self.assertRaises(self.mp.ProfileError):
+                self.mp.validate(bad)
+
+    def test_mask_and_proxy(self):
+        self.assertEqual(self.mp.mask("sk-1234567890abcdef"), "sk-123…cdef")
+        self.assertEqual(self.mp.mask(""), "(无)")
+        with tempfile.TemporaryDirectory() as td:
+            pf = Path(td) / "proxy.json"
+            pf.write_text('{"active": true}', encoding="utf-8")
+            with mock.patch.object(self.mp, "PROXY_FILE", pf):
+                self.assertTrue(self.mp.proxy_active())
+            pf.write_text('{"active": false}', encoding="utf-8")
+            with mock.patch.object(self.mp, "PROXY_FILE", pf):
+                self.assertFalse(self.mp.proxy_active())
+
+
+class TestModelSwitch(unittest.TestCase):
+    """QQ 切换模型全链路：热切换/连通失败回滚/反代互斥（临时 .env/档案）。"""
+
+    class _FakeClient:
+        def __init__(self, fail=False):
+            self.fail = fail
+            self.model = "fake"
+
+        async def chat(self, messages, temperature=None):
+            if self.fail:
+                from app.deepseek_api import DeepSeekError
+                raise DeepSeekError("连不上模型服务", "raw")
+
+        async def aclose(self):
+            pass
+
+    def setUp(self):
+        _ensure_nonebot_init()
+        from app.plugins import chat as chat_mod
+        self.chat = chat_mod
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        td = Path(self.tmp.name)
+        self.env = td / ".env"
+        self.env.write_text('DEEPSEEK_API_KEY="sk-live"\n'
+                            'DEEPSEEK_MODEL="gemini-test-flash"\n'
+                            'DEEPSEEK_BASE_URL="https://relay-a.example.com/v1"\n'
+                            'SUPERUSERS=["10000"]\n', encoding="utf-8")
+        self.profiles = td / "providers.json"
+        self.profiles.write_text(json.dumps({
+            "gemini": {"base_url": "https://relay-a.example.com/v1",
+                       "api_key": "sk-test-aaa111", "model": "gemini-test-flash"},
+            "qwen": {"base_url": "https://relay-b.example.com/v1",
+                     "api_key": "sk-test-bbb222", "model": "qwen/qwen3.7-flash:free"},
+            "坏档案": {"base_url": "https://x.com/v1", "api_key": "https://not-a-key",
+                     "model": "m"},
+        }, ensure_ascii=False), encoding="utf-8")
+        self.proxy = td / "proxy.json"
+        self.proxy.write_text('{"active": false}', encoding="utf-8")
+        patches = [
+            mock.patch.object(chat_mod, "ENV_FILE", self.env),
+            mock.patch.object(chat_mod.model_profiles, "PROFILES_FILE", self.profiles),
+            mock.patch.object(chat_mod.model_profiles, "PROXY_FILE", self.proxy),
+        ]
+        for p in patches:
+            p.start()
+        self.addCleanup(lambda: [p.stop() for p in patches])
+
+    def test_switch_success_writes_env(self):
+        fake = self._FakeClient()
+        with mock.patch.object(self.chat, "_ensure_client", lambda: fake):
+            ok, msg = asyncio.run(self.chat._switch_model("qwen"))
+        self.assertTrue(ok, msg)
+        self.assertIn("qwen", msg)
+        text = self.env.read_text(encoding="utf-8")
+        self.assertIn("relay-b.example.com", text)
+        self.assertIn("qwen/qwen3.7-flash:free", text)
+        self.assertIn("sk-test-bbb222", text)
+
+    def test_switch_failure_rolls_back(self):
+        fake = self._FakeClient(fail=True)
+        with mock.patch.object(self.chat, "_ensure_client", lambda: fake):
+            ok, msg = asyncio.run(self.chat._switch_model("qwen"))
+        self.assertFalse(ok)
+        self.assertIn("连通失败", msg)
+        self.assertIn("已保持原模型", msg)
+        text = self.env.read_text(encoding="utf-8")
+        self.assertNotIn("relay-b.example.com", text)   # 回滚：新地址不留存
+        self.assertIn("relay-a.example.com", text)
+        self.assertIn("sk-live", text)
+
+    def test_switch_refuses_bad_profile_and_proxy(self):
+        fake = self._FakeClient()
+        with mock.patch.object(self.chat, "_ensure_client", lambda: fake):
+            ok, msg = asyncio.run(self.chat._switch_model("坏档"))
+            self.assertFalse(ok)
+            self.assertIn("网址", msg)   # Key 字段被污染的档案拒绝
+            ok, msg = asyncio.run(self.chat._switch_model("不存在的"))
+            self.assertFalse(ok)
+            self.assertIn("模型列表", msg)
+        self.proxy.write_text('{"active": true}', encoding="utf-8")
+        with mock.patch.object(self.chat, "_ensure_client", lambda: fake):
+            ok, msg = asyncio.run(self.chat._switch_model("qwen"))
+            self.assertFalse(ok)
+            self.assertIn("反代", msg)
+
+
 if __name__ == "__main__":
     unittest.main()

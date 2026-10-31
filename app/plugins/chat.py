@@ -32,7 +32,8 @@ from nonebot.exception import FinishedException
 from nonebot.params import CommandArg
 from nonebot.rule import Rule
 
-from .. import assistant_state, jailbreak, personas, plugin_manager, tts, vision, web_search
+from .. import (assistant_state, jailbreak, model_profiles, personas,
+                plugin_manager, tts, vision, web_search)
 from ..deepseek_api import DeepSeekClient, DeepSeekError
 from ..envutil import ENV_FILE, ROOT, load_env, update_env
 from ..log_setup import redact_log
@@ -553,6 +554,10 @@ cmd_jb_resume = on_command("破甲继续", aliases={"破甲恢复"},
                            rule=_cmd_gate, priority=4, block=True)
 cmd_jb_preset = on_command("破甲预设", rule=_cmd_gate, priority=4, block=True)
 cmd_jb_status = on_command("破甲状态", rule=_cmd_gate, priority=4, block=True)
+cmd_model_list = on_command("模型列表", aliases={"模型档案"},
+                            rule=_cmd_gate, priority=4, block=True)
+cmd_model_switch = on_command("切换模型", aliases={"换模型"},
+                              rule=_cmd_gate, priority=4, block=True)
 
 msg_group = on_message(rule=Rule(_group_at_me), priority=10, block=True)
 msg_private = on_message(rule=Rule(_is_private), priority=50, block=True)
@@ -569,6 +574,7 @@ HELP_TEXT = (
     "· 人设 —— 查看当前人设和人设库\n"
     "· 切换人设 <名> —— 换一套人格（管理员）\n"
     "· 人设 <描述> —— 改当前人设的性格（管理员）\n"
+    "· 模型列表 / 切换模型 <名> —— 管理员切换模型源\n"
     "· 状态 —— 查看配置与运行状态（管理员）\n"
     "· 我是主人 —— 首次使用认领管理员 / 设置管理员 <QQ>（管理员）"
 )
@@ -1069,6 +1075,77 @@ async def _(matcher, event: MessageEvent, args: Message = CommandArg()):  # noqa
     if not jailbreak.set_preset(name):
         await matcher.finish("没有这个预设，可选：" + "、".join(jailbreak.PRESETS))
     await matcher.finish(f"✅ 破甲预设已切为「{name}」\n" + _jb_status_line())
+
+
+# ---------- 模型切换（管理员）：QQ 里一句话换模型源，热更新即时生效 ----------
+
+async def _switch_model(name: str) -> tuple[bool, str]:
+    """切换到指定档案：写 .env 三键 → 热更新 → 连通自检，失败自动回滚。
+
+    自检失败绝不留在新配置上：机器人永远处于可用状态。
+    """
+    profiles = model_profiles.load_profiles()
+    target = model_profiles.match_name(profiles, name)
+    if target is None:
+        return False, "没有这个模型档案，发「模型列表」看可用名单"
+    try:
+        model_profiles.validate(profiles[target])
+    except model_profiles.ProfileError as exc:
+        return False, f"「{target}」不可切换：{exc}"
+    if model_profiles.proxy_active():
+        return False, "反代运行中：模型源由反代管理，请先在面板停止反代"
+    before = load_env(ENV_FILE)
+    prev = {k: before.get(k, "") for k in ("DEEPSEEK_BASE_URL",
+                                           "DEEPSEEK_API_KEY", "DEEPSEEK_MODEL")}
+    p = profiles[target]
+    update_env(ENV_FILE, {"DEEPSEEK_BASE_URL": p["base_url"].strip(),
+                          "DEEPSEEK_API_KEY": (p.get("api_key") or "").strip(),
+                          "DEEPSEEK_MODEL": p["model"].strip()})
+    try:
+        async def _ping():
+            await _ensure_client().chat(
+                [{"role": "user", "content": "只回复两个字：正常"}],
+                temperature=0.0)
+
+        await asyncio.wait_for(_ping(), timeout=10)
+    except Exception as exc:   # noqa: BLE001 连不上/401/超时：回滚保可用
+        update_env(ENV_FILE, prev)
+        _ensure_client()
+        return False, (f"「{target}」连通失败（{str(exc)[:60]}），"
+                       f"已保持原模型 {prev.get('DEEPSEEK_MODEL') or '（原配置）'}")
+    return True, f"已切换到「{target}」：{p['model']}（连通正常）"
+
+
+@cmd_model_list.handle()
+async def _(matcher, event: MessageEvent):
+    if not _is_admin(event.user_id):
+        await matcher.finish("模型切换只有管理员可以操作")
+    profiles = model_profiles.load_profiles()
+    if not profiles:
+        await matcher.finish("还没有模型档案：先在控制台「模型配置」页保存一份")
+    live = _live_model_config()
+    lines = [f"🧠 模型档案（当前 ● {live['model']}）"]
+    for name, p in profiles.items():
+        cur = "●" if (p.get("base_url", "").rstrip("/") == live["base_url"].rstrip("/")
+                      and p.get("model", "") == live["model"]) else "○"
+        host = re.sub(r"^https?://", "",
+                      (p.get("base_url") or "").strip()).split("/")[0]
+        state = "" if model_profiles.is_usable(p) else "  ⚠ 无Key不可用"
+        lines.append(f"· {cur} {name} — {p.get('model') or '?'} @ {host}"
+                     f"（{model_profiles.mask(p.get('api_key') or '')}）{state}")
+    lines.append("切换：切换模型 <名字>（支持前缀）")
+    await matcher.finish("\n".join(lines))
+
+
+@cmd_model_switch.handle()
+async def _(matcher, event: MessageEvent, args: Message = CommandArg()):  # noqa: B008
+    if not _is_admin(event.user_id):
+        await matcher.finish("模型切换只有管理员可以操作")
+    name = args.extract_plain_text().strip()
+    if not name:
+        await matcher.finish("用法：切换模型 <名字>（发「模型列表」看名单）")
+    ok, msg_text = await _switch_model(name)
+    await matcher.finish(("✅ " if ok else "❌ ") + msg_text)
 
 
 @msg_private.handle()
