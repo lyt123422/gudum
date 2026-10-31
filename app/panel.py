@@ -170,6 +170,9 @@ async def _guard(request: Request, call_next):
             "default-src 'self'; script-src 'self' 'unsafe-inline'; "
             "style-src 'self' 'unsafe-inline'; img-src 'self' data:; "
             "frame-ancestors 'none'")
+        # 面板页面高频迭代：禁浏览器缓存，否则旧页面/旧 JS 被启发式缓存后
+        # 所有按钮都可能"点了没反应"（2026-10-31 用户实测踩坑）
+        response.headers.setdefault("Cache-Control", "no-store")
     return response
 
 
