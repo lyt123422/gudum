@@ -57,9 +57,10 @@ def _register_healthz() -> None:  # 仅本机排障用；HOST 已限定 127.0.0.
                 payload["onebot"]["login_info_error"] = str(exc)[:120]
         try:
             from .plugins import chat as _chat
+            _chat._ensure_client()   # 模型配置热更新：healthz 反映当前生效配置
             payload["deepseek"] = {
                 "model": _chat.client.model,
-                "api_key_set": bool(_chat._cfg("DEEPSEEK_API_KEY", "")),
+                "api_key_set": bool(_chat._live_model_config()["api_key"]),
                 "memory_sessions": _chat.memory_count(),
             }
         except Exception as exc:

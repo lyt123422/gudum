@@ -20,6 +20,15 @@ os.environ["PANEL_NO_OPEN"] = "1"   # 评审 v3 P1-8：测试绝不弹浏览器
 ROOT = Path(__file__).resolve().parents[1]
 
 
+def _ensure_nonebot_init() -> None:
+    """chat 模块导入时 on_command 需要全局 Driver：导入前保证已初始化。"""
+    import nonebot
+    try:
+        nonebot.init()
+    except Exception:   # noqa: BLE001 已初始化过则跳过
+        pass
+
+
 class TestMaskedKey(unittest.TestCase):
     """评审 P0-1：掩码 Key 必须被识别并拒绝（全部在临时 .env 上验证）。"""
 
@@ -76,13 +85,15 @@ class TestSaveChangedDetection(unittest.TestCase):
         self.addCleanup(lambda: [x.stop() for x in patches])
         return TestClient(panel.app, base_url="http://127.0.0.1:8090"), started, env
 
-    def test_model_change_restarts(self):
+    def test_model_change_hot_reload(self):
+        """模型热更新：保存不重启内核，note 提示即时生效。"""
         with tempfile.TemporaryDirectory() as tmp:
             client, started, _ = self._client(Path(tmp))
             r = client.post("/api/save", json={"model": "deepseek-reasoner"}).json()
             self.assertTrue(r["ok"])
-            self.assertTrue(r["bot_restarted"])
-            self.assertEqual(started["n"], 1)
+            self.assertFalse(r["bot_restarted"])
+            self.assertIn("即时生效", r["note"] or "")
+            self.assertEqual(started["n"], 0)
 
     def test_account_only_no_restart(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -92,14 +103,21 @@ class TestSaveChangedDetection(unittest.TestCase):
             self.assertFalse(r["bot_restarted"])
             self.assertEqual(started["n"], 0)
 
-    def test_superusers_change_restarts(self):
+    def test_superusers_change_hot(self):
+        """管理员变更：不重启内核；内核侧经 .env 热读立即生效。"""
+        _ensure_nonebot_init()
         with tempfile.TemporaryDirectory() as tmp:
-            client, started, _ = self._client(Path(tmp))
+            from app.plugins import chat as chat_mod
+            client, started, env = self._client(Path(tmp))
+            env_chat = mock.patch.object(chat_mod, "ENV_FILE", env)
+            env_chat.start()
+            self.addCleanup(env_chat.stop)
             r = client.post("/api/save", json={"superuser": "111111111,222222222"}).json()
             self.assertTrue(r["ok"])
-            self.assertTrue(r["bot_restarted"])
-            self.assertIn('["111111111", "222222222"]',
-                          (Path(tmp) / ".env").read_text(encoding="utf-8"))
+            self.assertFalse(r["bot_restarted"])
+            self.assertEqual(started["n"], 0)
+            self.assertIn('["111111111", "222222222"]', env.read_text(encoding="utf-8"))
+            self.assertIn("111111111", chat_mod._real_admins())
 
     def test_evil_base_without_key_rejected(self):
         """评审 v3 P0-1 + 审计 F3：换 base 不带 Key——本地地址放行但必须清掉
@@ -118,7 +136,7 @@ class TestSaveChangedDetection(unittest.TestCase):
                 "model": "deepseek-chat"}).json()
             self.assertFalse(r2["ok"])
             self.assertIn("API Key", r2["error"])
-            self.assertEqual(started["n"], 1)   # 第一次保存真改了配置：重启是预期行为
+            self.assertEqual(started["n"], 0)   # 热更新后保存不再重启内核
 
     def test_evil_base_with_new_key_allowed(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -1607,6 +1625,65 @@ class TestLogRotation(unittest.TestCase):
             small.write_text("tiny", encoding="utf-8")
             panel._rotate_log(small)
             self.assertTrue(small.exists())
+
+
+class TestModelHotReload(unittest.TestCase):
+    """模型配置热更新：改 .env 不重启内核，下一句即用新配置（QQ 不掉线）。"""
+
+    def test_client_rebuilds_on_env_change(self):
+        _ensure_nonebot_init()
+        from app.plugins import chat as chat_mod
+        orig_client, orig_fp = chat_mod.client, chat_mod._client_fp
+        self.addCleanup(setattr, chat_mod, "client", orig_client)
+        self.addCleanup(setattr, chat_mod, "_client_fp", orig_fp)
+        with tempfile.TemporaryDirectory() as td:
+            env = Path(td) / ".env"
+            env.write_text("DEEPSEEK_MODEL=model-a\n"
+                           "DEEPSEEK_BASE_URL=https://api.example.com\n"
+                           "DEEPSEEK_TIMEOUT=60\nCHAT_MAX_TOKENS=4096\n",
+                           encoding="utf-8")
+            with mock.patch.object(chat_mod, "ENV_FILE", env):
+                c1 = chat_mod._ensure_client()
+                self.assertEqual(c1.model, "model-a")
+                env.write_text("DEEPSEEK_MODEL=model-b\n"
+                               "DEEPSEEK_BASE_URL=https://api.example.com\n"
+                               "DEEPSEEK_TIMEOUT=60\nCHAT_MAX_TOKENS=4096\n",
+                               encoding="utf-8")
+                c2 = chat_mod._ensure_client()
+                self.assertEqual(c2.model, "model-b")
+                self.assertIsNot(c1, c2)
+                self.assertIs(chat_mod._ensure_client(), c2)   # 指纹未变：复用
+
+    def test_save_model_no_restart(self):
+        """面板保存模型：即时生效，不再重启内核（QQ 保持在线）。"""
+        with tempfile.TemporaryDirectory() as td:
+            from fastapi.testclient import TestClient
+            from app import panel
+            env = Path(td) / ".env"
+            env.write_text('DEEPSEEK_API_KEY="sk-old"\n'
+                           'DEEPSEEK_MODEL="deepseek-chat"\n'
+                           'DEEPSEEK_BASE_URL="https://api.deepseek.com"\n'
+                           'SUPERUSERS=["10000"]\n', encoding="utf-8")
+            restart_mock = mock.AsyncMock(return_value=True)
+            patches = [
+                mock.patch.object(panel, "ENV_FILE", env),
+                mock.patch.object(panel, "PROVIDERS_FILE", Path(td) / "providers.json"),
+                mock.patch.object(panel, "_running", lambda n: False),
+                mock.patch.object(panel, "_pid_on_port", lambda p: None),
+                mock.patch.object(panel, "_restart_kernel_if_running", restart_mock),
+            ]
+            for p in patches:
+                p.start()
+            self.addCleanup(lambda: [p.stop() for p in patches])
+            client = TestClient(panel.app, base_url="http://127.0.0.1:8090")
+            r = client.post("/api/save", json={
+                "base_url": "https://api.deepseek.com",
+                "api_key": "sk-new", "model": "deepseek-chat"}).json()
+            self.assertTrue(r["ok"], r)
+            self.assertFalse(r.get("bot_restarted"))
+            restart_mock.assert_not_awaited()
+            self.assertIn("即时生效", r.get("note") or "")
+            self.assertIn("sk-new", env.read_text(encoding="utf-8"))
 
 
 if __name__ == "__main__":

@@ -34,27 +34,71 @@ from nonebot.rule import Rule
 
 from .. import assistant_state, jailbreak, personas, plugin_manager, tts, vision, web_search
 from ..deepseek_api import DeepSeekClient, DeepSeekError
-from ..envutil import ENV_FILE, ROOT, update_env
+from ..envutil import ENV_FILE, ROOT, load_env, update_env
 from ..log_setup import redact_log
 
 
 def _cfg(name: str, default: str) -> str:
-    """配置读取：优先 nonebot 已加载的 .env（键会转小写），兜底进程环境变量。"""
-    v = getattr(get_driver().config, name.lower(), None)
+    """配置读取：优先 nonebot 已加载的 .env（键会转小写），兜底进程环境变量。
+
+    nonebot 未初始化（测试/独立导入）时不抛错，直接走环境变量与默认值。
+    """
+    try:
+        v = getattr(get_driver().config, name.lower(), None)
+    except Exception:   # noqa: BLE001
+        v = None
     if v is None or v == "":
         v = os.getenv(name)
     return str(v) if v not in (None, "") else default
 
 
-client = DeepSeekClient(
-    base_url=_cfg("DEEPSEEK_BASE_URL", "https://api.deepseek.com"),
-    api_key=_cfg("DEEPSEEK_API_KEY", ""),
-    model=_cfg("DEEPSEEK_MODEL", "deepseek-chat"),
-    timeout=float(_cfg("DEEPSEEK_TIMEOUT", "60")),
-    # 推理模型（*-flash-high / reasoner）的思考 token 算进这个预算：
-    # 2048 会在长思考时把正文挤成空字符串（实测 gemini-test-flash 约 1/3 概率）
-    max_tokens=int(_cfg("CHAT_MAX_TOKENS", "4096")),
-)
+def _live_model_config() -> dict:
+    """运行期模型配置的唯一事实源：面板保存直接写 .env，内核按需重读。
+
+    运行中的 nonebot 驱动配置是启动快照（读到旧值），所以直读 .env 文件
+    ——面板与内核同机，文件就是最新值。
+    """
+    env = load_env(ENV_FILE)
+    return {
+        "base_url": (env.get("DEEPSEEK_BASE_URL") or "").strip()
+                    or _cfg("DEEPSEEK_BASE_URL", "https://api.deepseek.com"),
+        "api_key": (env.get("DEEPSEEK_API_KEY") or "").strip(),
+        "model": (env.get("DEEPSEEK_MODEL") or "").strip()
+                 or _cfg("DEEPSEEK_MODEL", "deepseek-chat"),
+        "timeout": float((env.get("DEEPSEEK_TIMEOUT") or "").strip()
+                         or _cfg("DEEPSEEK_TIMEOUT", "60")),
+        # 推理模型（*-flash-high / reasoner）的思考 token 算进这个预算：
+        # 2048 会在长思考时把正文挤成空字符串（实测 gemini-test-flash 约 1/3 概率）
+        "max_tokens": int((env.get("CHAT_MAX_TOKENS") or "").strip()
+                          or _cfg("CHAT_MAX_TOKENS", "4096")),
+    }
+
+
+client: DeepSeekClient | None = None
+_client_fp = ""
+
+
+def _ensure_client() -> DeepSeekClient:
+    """按配置指纹惰性重建 LLM 客户端。
+
+    面板改完模型保存后，下一句话就用新配置——不用重启内核、QQ 不掉线
+    （模型配置热更新）。指纹没变就复用现有客户端，零开销。
+    """
+    global client, _client_fp
+    cfg = _live_model_config()
+    fp = "|".join(str(v) for v in cfg.values())
+    if client is None or fp != _client_fp:
+        old, client = client, DeepSeekClient(**cfg)
+        _client_fp = fp
+        if old is not None:
+            try:
+                asyncio.get_running_loop().create_task(old.aclose())
+            except Exception:   # noqa: BLE001 旧连接池释放失败不影响新客户端
+                pass
+    return client
+
+
+_ensure_client()   # 导入时构建一次，healthz/状态指令随时可读
 
 MEMORY_HOURS = float(_cfg("MEMORY_HOURS", "2"))
 MEMORY_MAX_ROUNDS = max(1, int(_cfg("MEMORY_MAX_ROUNDS", "12")))  # 0 会变"保留全部"，钳到 1
@@ -338,7 +382,18 @@ def _claimed_admins() -> set[str]:
 
 
 def _real_admins() -> set[str]:
-    configured = {str(s) for s in get_driver().config.superusers} - {""}
+    try:
+        configured = {str(s) for s in get_driver().config.superusers} - {""}
+    except Exception:   # noqa: BLE001 无 nonebot 环境（测试/独立调用）时跳过该来源
+        configured = set()
+    try:
+        # 管理员热更新：面板保存写 .env，这里直读（与模型配置同机制）
+        raw = load_env(ENV_FILE).get("SUPERUSERS") or "[]"
+        env_su = json.loads(raw)
+        if isinstance(env_su, list):
+            configured |= {str(x) for x in env_su if str(x).isdigit()}
+    except (OSError, ValueError):
+        pass
     if configured == {"10000"}:   # 出厂占位值，不视为已设置管理员
         configured = set()
     return configured | _claimed_admins() | _EXTRA_ADMINS
@@ -570,6 +625,7 @@ async def _send_chunks(matcher, answer: str) -> None:
 async def _do_chat(matcher, event: MessageEvent, q: str,
                    force_web: bool = False, images: list[str] | None = None) -> None:
     """公共聊天管线：群冷却 → 限频 → 会话锁 → 联网判定 → 人设+记忆 → 调用 → 回复(可带语音)。"""
+    _ensure_client()   # 模型配置热更新：面板保存后下一句即用新配置
     uid = str(event.user_id)
     if event.message_type == "group" and not _allow_group(getattr(event, "group_id", 0)):
         return  # 群冷却期内静默，不刷屏、也不扣个人额度（评审 P2-4）
@@ -921,6 +977,7 @@ async def _(matcher, event: MessageEvent, args: Message = CommandArg()):  # noqa
 async def _(matcher, event: MessageEvent):
     if not _is_admin(event.user_id):
         return  # 非管理员静默，不暴露配置
+    _ensure_client()   # 显示当前生效配置（含面板刚保存还未聊过天的场景）
     key = _cfg("DEEPSEEK_API_KEY", "")
     masked = (key[:6] + "…" + key[-4:]) if len(key) > 12 else ("(未填写)" if not key else "…")
     await matcher.finish("\n".join([

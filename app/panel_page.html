@@ -625,9 +625,10 @@ async function saveCfg(part){
   body:JSON.stringify(body)});
  const j=await r.json();
  const okm=part==='model'?'cfg-msg':'qq-msg';
- const m=j.ok?('✅ 已保存'+(part==='model'
-   ?(j.bot_restarted?'，机器人已重启生效':'（机器人未运行，下次启动生效）'):''))
-  :'❌ '+(j.error||'保存失败');
+ const m=j.ok?(part==='model'
+   ?'✅ 已保存，模型配置即时生效（QQ 不掉线）'
+   :'✅ 已保存')
+   :'❌ '+(j.error||'保存失败');
  msg(okm,m,j.ok?'ok':'err');
  if(j.note)msg(okm,m+'　'+j.note,j.ok?'ok':'err');
  if(j.ok){cfgDirty=false;

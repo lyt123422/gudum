@@ -465,19 +465,14 @@ async def api_save(request: Request) -> dict:
             personas.set_persona_text(personas.active_name(), persona_text)
         except (KeyError, OSError) as exc:
             return {"ok": False, "error": f"人设保存失败: {exc}"}
-    # 内核启动时读配置：DEEPSEEK_*/SUPERUSERS 真变化才重启，避免无谓断连（评审 P1-1）
-    restart_keys = ("DEEPSEEK_BASE_URL", "DEEPSEEK_API_KEY", "DEEPSEEK_MODEL",
-                    "SUPERUSERS")
+    # 模型配置热更新（评审换轮）：内核每轮聊天前重读 .env 并按指纹重建客户端，
+    # DEEPSEEK_* 变化不再重启内核——QQ 连接保持不掉线；SUPERUSERS 走
+    # admins.json 本就实时生效。只有装/卸第三方插件才需要真重启。
+    restart_keys = ("DEEPSEEK_BASE_URL", "DEEPSEEK_API_KEY", "DEEPSEEK_MODEL")
     changed = any(values.get(k) is not None and values.get(k, "") != before.get(k, "")
                   for k in restart_keys)
-    bot_restarted = False
-    if changed and (_running("bot") or _pid_on_port(BOT_PORT)):
-        bot_restarted = await _restart_kernel_if_running()
-        if not bot_restarted:
-            return {"ok": False,
-                    "error": "配置已保存，但内核重启失败，请到运行日志排查"}
-    return {"ok": True, "bot_restarted": bot_restarted,
-            "note": proxy_note or None}
+    note = proxy_note or ("模型配置已即时生效，QQ 无需重新登录" if changed else None)
+    return {"ok": True, "bot_restarted": False, "note": note}
 
 
 @app.post("/api/account/adopt")
