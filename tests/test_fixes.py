@@ -1993,5 +1993,73 @@ class TestPlainify(unittest.TestCase):
         self.assertEqual(chat_mod._plainify("2*3*4=24"), "2*3*4=24")   # 数学星号不误伤
 
 
+class TestWebSearchFallback(unittest.TestCase):
+    """联网搜索降级链：DDG 被墙环境自动落必应中国（2026-10-31 服务器实测）。"""
+
+    def test_ddg_fails_falls_back_to_bing(self):
+        from app import web_search as ws
+        calls = []
+
+        async def fake_ddg(q, limit):
+            calls.append("ddg")
+            raise RuntimeError("blocked")
+
+        async def fake_bing(q, limit):
+            calls.append("bing")
+            return [{"title": "t", "snippet": "s", "url": "https://u.example"}]
+
+        with mock.patch.object(ws, "_search_duckduckgo", fake_ddg), \
+                mock.patch.object(ws, "_search_bing", fake_bing):
+            results = asyncio.run(ws.search("测试"))
+        self.assertEqual(calls, ["ddg", "bing"])
+        self.assertEqual(results[0]["url"], "https://u.example")
+
+    def test_tavily_first_with_key(self):
+        from app import web_search as ws
+        calls = []
+
+        async def fake_tavily(q, limit, key):
+            calls.append("tavily")
+            return [{"title": "t", "snippet": "s", "url": "https://u.example"}]
+
+        async def fail_ddg(q, limit):
+            calls.append("ddg")
+            raise RuntimeError("blocked")
+
+        with mock.patch.object(ws, "_search_tavily", fake_tavily), \
+                mock.patch.object(ws, "_search_duckduckgo", fail_ddg), \
+                mock.patch.object(ws, "_search_bing", fail_ddg):
+            results = asyncio.run(ws.search("测试", provider="tavily",
+                                            tavily_key="k"))
+        self.assertEqual(calls, ["tavily"])
+        self.assertEqual(results[0]["url"], "https://u.example")
+
+    def test_all_fail_raises_last(self):
+        from app import web_search as ws
+
+        async def fail(q, limit):
+            raise RuntimeError("全挂")
+
+        with mock.patch.object(ws, "_search_duckduckgo", fail), \
+                mock.patch.object(ws, "_search_bing", fail):
+            with self.assertRaises(RuntimeError):
+                asyncio.run(ws.search("测试"))
+
+    def test_bing_rss_parsing(self):
+        from app import web_search as ws
+        sample = ("<rss><channel>"
+                  "<item><title>标题一</title>"
+                  "<link>https://a.example/x</link>"
+                  "<description>描述一</description></item>"
+                  "<item><title>标题二</title>"
+                  "<link>https://b.example/y</link>"
+                  "<description><![CDATA[描述二]]></description></item>"
+                  "</channel></rss>")
+        entries = ws._parse_bing_rss(sample, 5)
+        self.assertEqual(len(entries), 2)
+        self.assertEqual(entries[0]["title"], "标题一")
+        self.assertEqual(entries[1]["url"], "https://b.example/y")
+
+
 if __name__ == "__main__":
     unittest.main()
