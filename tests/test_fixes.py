@@ -1969,16 +1969,20 @@ class TestPlainify(unittest.TestCase):
         _ensure_nonebot_init()
         from app.plugins import chat as chat_mod
         raw = ("### 标题\n**加粗**内容\n---\n* 项目一\n* 项目二\n"
-               "`代码` 和 **再见**")
+               "`代码` 和 **再见**\n| 列1 | 列2 |\n|-----|-----|\n| a | b |\n> 引用")
         out = chat_mod._plainify(raw)
         self.assertNotIn("**", out)
         self.assertNotIn("###", out)
         self.assertNotIn("---", out)
         self.assertNotIn("`", out)
+        self.assertNotIn("|-----|", out)   # 表格分隔行整行删除
+        self.assertNotIn("> 引用", out)
         self.assertIn("标题", out)
         self.assertIn("加粗内容", out)
         self.assertIn("· 项目一", out)
         self.assertIn("· 项目二", out)
+        self.assertIn("a | b", out)        # 表格数据行保留（竖线可读）
+        self.assertIn("引用", out)
 
     def test_plain_untouched_and_zero_width(self):
         _ensure_nonebot_init()

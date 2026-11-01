@@ -676,6 +676,8 @@ _MD_BOLD_RE = re.compile(r"\*\*(.+?)\*\*", re.S)
 _MD_BOLD2_RE = re.compile(r"__(.+?)__", re.S)
 _MD_ITALIC_RE = re.compile(r"(?<![\w*])\*([^*\s][^*\n]*?)\*(?![\w*])")
 _MD_BULLET_RE = re.compile(r"^\s*[-*]\s+", re.M)
+_MD_TABLE_SEP_RE = re.compile(r"^[ \t|:-]*-[ \t|:-]*$", re.M)   # |---|---| 表格分隔行
+_MD_QUOTE_RE = re.compile(r"^\s*>\s?", re.M)                     # > 引用
 _MD_BACKTICK_RE = re.compile(r"[\x60]+")
 _ZW_RE = re.compile(r"[\u200b-\u200f\ufeff]")
 
@@ -683,18 +685,21 @@ _ZW_RE = re.compile(r"[\u200b-\u200f\ufeff]")
 def _plainify(text: str) -> str:
     """把模型输出的 Markdown 转成 QQ 纯文本。
 
-    外国模型（gemini/ministral 等）默认输出 **加粗**、### 标题、--- 分隔线，
-    QQ 不渲染，用户看到的是原始符号（2026-10-31 实测每条 8~15 处）。
-    只去格式、不动内容；中文引号等正常标点保留。
+    外国模型（gemini/ministral 等）默认输出 **加粗**、### 标题、--- 分隔线、
+    表格、> 引用，QQ 不渲染，用户看到的是原始符号（2026-10-31 实测每条
+    8~15 处，表格分隔行也实测出现过）。只去格式、不动内容；
+    中文引号等正常标点保留，数学星号不误伤。
     """
     text = _ZW_RE.sub("", text)
     text = _MD_FENCE_RE.sub("", text)
+    text = _MD_TABLE_SEP_RE.sub("", text)   # 表格分隔行整行删除
     text = _MD_HR_RE.sub("", text)
     text = _MD_HEAD_RE.sub("", text)
     text = _MD_BOLD_RE.sub(r"\1", text)
     text = _MD_BOLD2_RE.sub(r"\1", text)
     text = _MD_ITALIC_RE.sub(r"\1", text)
     text = _MD_BULLET_RE.sub("· ", text)
+    text = _MD_QUOTE_RE.sub("", text)
     text = _MD_BACKTICK_RE.sub("", text)
     return re.sub(r"\n{3,}", "\n\n", text).strip()
 
