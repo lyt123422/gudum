@@ -1294,6 +1294,20 @@ async def _napcat_probe(qq: str) -> str:
     return "waiting_qr" if _napcat_qr_waiting() else ""
 
 
+def _systemd_napcat_active() -> bool:
+    """服务器部署：NapCat 由 systemd 托管（gudum-napcat.service），面板 _procs
+    追踪不到会误显示"已停止"（2026-11-01 用户踩坑）。用 systemctl 补充判断；
+    Windows 无该服务文件，直接返回 False。"""
+    if not Path("/etc/systemd/system/gudum-napcat.service").exists():
+        return False
+    try:
+        r = subprocess.run(["systemctl", "is-active", "--quiet", "gudum-napcat"],
+                           capture_output=True, timeout=3)
+        return r.returncode == 0
+    except Exception:   # noqa: BLE001
+        return False
+
+
 @app.get("/api/status")
 async def api_status() -> dict:
     # 以 healthz 为准（无论内核是面板启动还是 start.bat 手动启动都能看到）
@@ -1335,10 +1349,11 @@ async def api_status() -> dict:
         except OSError:
             pass
     mem_dir = MEM_DIR
+    napcat_managed = _running("napcat") or _systemd_napcat_active()
     napcat_up = round(time.time() - _spawn_ts["napcat"], 1) \
         if _running("napcat") and _spawn_ts["napcat"] else 0
     return {"bot_running": _running("bot") or kernel_up,
-            "napcat_running": _running("napcat"),
+            "napcat_running": napcat_managed,
             "qq_connected": qq_connected,
             "logged_in_qq": logged_in_uid,
             "claim_code": claim_code,
