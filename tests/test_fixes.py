@@ -2061,5 +2061,53 @@ class TestWebSearchFallback(unittest.TestCase):
         self.assertEqual(entries[1]["url"], "https://b.example/y")
 
 
+class TestApiRetry(unittest.TestCase):
+    """模型调用自动重试：连接类异常重试一次，语义错误不重试。"""
+
+    def _client(self, create_impl):
+        from app.deepseek_api import DeepSeekClient
+        c = DeepSeekClient("https://x.example", "k", "m")
+
+        class FakeCompletions:
+            async def create(self, **kw):
+                return await create_impl()
+
+        c._client = type("C", (), {"chat": type(
+            "Chat", (), {"completions": FakeCompletions()})()})()
+        return c
+
+    def test_transient_error_retried_once(self):
+        calls = {"n": 0}
+
+        async def impl():
+            calls["n"] += 1
+            if calls["n"] == 1:
+                raise RuntimeError("")   # 空描述异常：上游断流特征
+            return type("R", (), {"choices": [type("Ch", (), {
+                "message": type("M", (), {"content": "正常", "tool_calls": None})(),
+                "finish_reason": "stop"})()]})()
+
+        c = self._client(impl)
+        with mock.patch("asyncio.sleep", mock.AsyncMock()):
+            reply = asyncio.run(c.chat([{"role": "user", "content": "x"}]))
+        self.assertEqual(reply, "正常")
+        self.assertEqual(calls["n"], 2)
+
+    def test_auth_error_not_retried(self):
+        import openai
+        calls = {"n": 0}
+
+        async def impl():
+            calls["n"] += 1
+            raise openai.AuthenticationError(
+                "bad key", response=mock.Mock(status_code=401), body=None)
+
+        c = self._client(impl)
+        from app.deepseek_api import DeepSeekError
+        with self.assertRaises(DeepSeekError):
+            asyncio.run(c.chat([{"role": "user", "content": "x"}]))
+        self.assertEqual(calls["n"], 1)   # 401 不重试
+
+
 if __name__ == "__main__":
     unittest.main()

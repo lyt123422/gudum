@@ -5,6 +5,8 @@
 """
 from __future__ import annotations
 
+import asyncio
+
 import openai
 
 
@@ -59,9 +61,25 @@ class DeepSeekClient:
             extra["presence_penalty"] = self.presence_penalty
         return extra
 
+    async def _call_with_retry(self, **kwargs):
+        """间歇性断流自动重试一次（2026-11-01 实测：上游中转偶发掐断连接，
+        底层异常描述为空，被兜底成"AI 服务出了点小问题"）。
+
+        - 语义明确的错误（Key 无效/限流/参数错/HTTP 状态码）不重试，直接抛；
+        - 连接中断/未知异常重试一次；仍失败则抛出，由外层翻译成用户文案。
+        """
+        try:
+            return await self._client.chat.completions.create(**kwargs)
+        except (openai.AuthenticationError, openai.RateLimitError,
+                openai.BadRequestError, openai.APIStatusError):
+            raise
+        except Exception:   # noqa: BLE001 连接类/未知类：等 1 秒重试一次
+            await asyncio.sleep(1.0)
+            return await self._client.chat.completions.create(**kwargs)
+
     async def _create(self, messages: list[dict], temperature: float | None,
                       max_tokens: int):
-        return await self._client.chat.completions.create(
+        return await self._call_with_retry(
             model=self.model,
             messages=messages,  # type: ignore[arg-type]
             max_tokens=max_tokens,
@@ -144,7 +162,7 @@ class DeepSeekClient:
         msgs = list(messages)
         try:
             for _ in range(max_rounds):
-                resp = await self._client.chat.completions.create(
+                resp = await self._call_with_retry(
                     model=self.model,
                     messages=msgs,  # type: ignore[arg-type]
                     tools=tools,
@@ -177,7 +195,7 @@ class DeepSeekClient:
             # 轮次用尽：让模型基于已收集的信息直接回答
             msgs.append({"role": "system",
                          "content": "工具轮次已用完，请基于以上信息直接回答用户。"})
-            resp = await self._client.chat.completions.create(
+            resp = await self._call_with_retry(
                 model=self.model,
                 messages=msgs,  # type: ignore[arg-type]
                 max_tokens=self.max_tokens,
